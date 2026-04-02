@@ -176,11 +176,19 @@ far more complexity than the problem requires.
 
 ## How it works
 
-iron-proxy runs a DNS server and an HTTP/HTTPS proxy. Point your container's DNS
-at iron-proxy and all hostname lookups resolve to the proxy IP, routing traffic
-through it automatically. The proxy terminates TLS (generating leaf certs on the
-fly from a CA you provide), runs the request through an ordered transform
-pipeline, forwards it upstream, and runs the response back through the pipeline.
+iron-proxy runs a DNS server and an HTTP/HTTPS proxy. You can route traffic to
+it in two ways:
+
+- **Transparent / DNS-steered mode:** point your container's DNS at iron-proxy
+  so hostnames resolve to the proxy IP and HTTP/HTTPS traffic lands on the
+  proxy automatically.
+- **Explicit proxy mode:** point `HTTP_PROXY` / `HTTPS_PROXY` at iron-proxy.
+  Plain HTTP uses regular forward-proxy request routing; HTTPS uses `CONNECT`,
+  after which iron-proxy performs the same TLS MITM and transform pipeline.
+
+In either mode, the proxy terminates TLS (generating leaf certs on the fly from
+a CA you provide), runs the request through an ordered transform pipeline,
+forwards it upstream, and runs the response back through the pipeline.
 
 ```
 Container → DNS lookup → iron-proxy IP → TLS termination → transforms → upstream
@@ -287,7 +295,24 @@ it via `--cacert`). Certs are cached in an LRU cache keyed by SNI hostname.
 
 ## Routing traffic to the proxy
 
-There are three approaches, with increasing enforcement.
+There are four approaches, with increasing enforcement.
+
+### Explicit proxy (`HTTP_PROXY` / `HTTPS_PROXY`)
+
+Point your workload's proxy environment variables at iron-proxy. This works well
+when the application already supports explicit outbound proxying and you want to
+keep DNS policy separate:
+
+```bash
+export HTTP_PROXY=http://iron-proxy.internal:10000
+export HTTPS_PROXY=http://iron-proxy.internal:10000
+```
+
+For HTTPS, clients establish a `CONNECT` tunnel to iron-proxy. iron-proxy then
+terminates TLS inside that tunnel, applies the allowlist and secrets
+transforms, and opens a new upstream TLS connection to the real destination.
+
+The client must still trust the iron-proxy CA for HTTPS interception to work.
 
 ### DNS-based (simple)
 

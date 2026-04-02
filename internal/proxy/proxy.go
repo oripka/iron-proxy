@@ -4,6 +4,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -94,12 +95,17 @@ func (p *Proxy) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, er
 }
 
 func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		p.handleConnect(w, r)
+		return
+	}
+
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
 	}
 
-	host := r.Host
+	host := targetHost(r)
 	if host == "" {
 		http.Error(w, "missing Host header", http.StatusBadRequest)
 		return
@@ -215,6 +221,87 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeResponse(w, finalResp)
+}
+
+func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if host == "" {
+		http.Error(w, "missing CONNECT host", http.StatusBadRequest)
+		return
+	}
+
+	hostOnly := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostOnly = h
+	}
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "CONNECT not supported", http.StatusInternalServerError)
+		return
+	}
+
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		p.logger.Error("connect hijack failed", slog.String("error", err.Error()))
+		return
+	}
+
+	if _, err := clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		p.logger.Error("connect response write failed", slog.String("host", host), slog.String("error", err.Error()))
+		clientConn.Close()
+		return
+	}
+	if err := clientBuf.Flush(); err != nil {
+		p.logger.Error("connect response flush failed", slog.String("host", host), slog.String("error", err.Error()))
+		clientConn.Close()
+		return
+	}
+
+	tlsConn := tls.Server(&bufferedConn{
+		Conn:   clientConn,
+		reader: clientBuf.Reader,
+	}, &tls.Config{
+		GetCertificate: p.getCertificate,
+		MinVersion:     tls.VersionTLS12,
+	})
+
+	_ = tlsConn.SetDeadline(time.Now().Add(30 * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		p.logger.Warn("connect tls handshake failed",
+			slog.String("host", host),
+			slog.String("error", err.Error()),
+		)
+		clientConn.Close()
+		return
+	}
+	_ = tlsConn.SetDeadline(time.Time{})
+
+	if serverName := tlsConn.ConnectionState().ServerName; serverName == "" || !strings.EqualFold(serverName, hostOnly) {
+		p.logger.Warn("connect target/SNI mismatch",
+			slog.String("connect_host", hostOnly),
+			slog.String("sni", tlsConn.ConnectionState().ServerName),
+		)
+		_, _ = io.WriteString(tlsConn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 31\r\nContent-Type: text/plain\r\n\r\nCONNECT target and SNI mismatch")
+		tlsConn.Close()
+		return
+	}
+
+	server := &http.Server{
+		Handler:           http.HandlerFunc(p.handleHTTP),
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+
+	err = server.Serve(&singleConnListener{
+		conn: tlsConn,
+		addr: clientConn.LocalAddr(),
+	})
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+		p.logger.Error("connect session failed",
+			slog.String("host", host),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // isWebSocketUpgrade detects a WebSocket upgrade request.
@@ -365,7 +452,7 @@ var upstreamTransport = &http.Transport{
 	}).DialContext,
 	MaxIdleConns:          100,
 	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:  10 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
 	ResponseHeaderTimeout: 30 * time.Second,
 }
 
@@ -379,4 +466,46 @@ func copyHeaders(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+func targetHost(r *http.Request) string {
+	if r.Host != "" {
+		return r.Host
+	}
+	return r.URL.Host
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+type singleConnListener struct {
+	conn net.Conn
+	addr net.Addr
+	used bool
+}
+
+func (l *singleConnListener) Accept() (net.Conn, error) {
+	if l.used {
+		return nil, io.EOF
+	}
+	l.used = true
+	return l.conn, nil
+}
+
+func (l *singleConnListener) Close() error { return nil }
+
+func (l *singleConnListener) Addr() net.Addr {
+	if l.addr != nil {
+		return l.addr
+	}
+	if l.conn != nil {
+		return l.conn.LocalAddr()
+	}
+	return &net.TCPAddr{}
 }

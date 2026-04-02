@@ -15,15 +15,19 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/ironsh/iron-proxy/internal/certcache"
 	"github.com/ironsh/iron-proxy/internal/transform"
+	_ "github.com/ironsh/iron-proxy/internal/transform/allowlist"
+	_ "github.com/ironsh/iron-proxy/internal/transform/secrets"
 )
 
 func testLogger() *slog.Logger {
@@ -56,13 +60,16 @@ func generateTestCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
 }
 
 func startProxy(t *testing.T) (*Proxy, string, string, *x509.CertPool) {
+	return startProxyWithPipeline(t, transform.NewPipeline(nil, testLogger()))
+}
+
+func startProxyWithPipeline(t *testing.T, pipeline *transform.Pipeline) (*Proxy, string, string, *x509.CertPool) {
 	t.Helper()
 
 	caCert, caKey := generateTestCA(t)
 	cache, err := certcache.NewFromCA(caCert, caKey, 100, 72*time.Hour)
 	require.NoError(t, err)
 
-	pipeline := transform.NewPipeline(nil, testLogger())
 	p := New("127.0.0.1:0", "127.0.0.1:0", cache, pipeline, testLogger())
 
 	// Start HTTP listener manually to get random port
@@ -88,6 +95,28 @@ func startProxy(t *testing.T) (*Proxy, string, string, *x509.CertPool) {
 	pool.AddCert(caCert)
 
 	return p, httpAddr, httpsAddr, pool
+}
+
+func buildPipeline(t *testing.T, configYAML string) *transform.Pipeline {
+	t.Helper()
+
+	var cfg struct {
+		Transforms []struct {
+			Name   string    `yaml:"name"`
+			Config yaml.Node `yaml:"config"`
+		} `yaml:"transforms"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(configYAML), &cfg))
+
+	var transformers []transform.Transformer
+	for _, tc := range cfg.Transforms {
+		factory, err := transform.Lookup(tc.Name)
+		require.NoError(t, err)
+		instance, err := factory(tc.Config)
+		require.NoError(t, err)
+		transformers = append(transformers, instance)
+	}
+	return transform.NewPipeline(transformers, testLogger())
 }
 
 func TestHTTPProxy(t *testing.T) {
@@ -224,6 +253,118 @@ func TestHTTPSProxy_SNIHostMismatch(t *testing.T) {
 	defer resp.Body.Close()
 
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestExplicitHTTPSProxy_CONNECT(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "hello from explicit connect")
+	}))
+	defer upstream.Close()
+
+	_, httpAddr, _, caPool := startProxy(t)
+
+	const fakeHost = "connect.example.com"
+	upstreamAddr := upstream.Listener.Addr().String()
+
+	origTransport := upstreamTransport
+	upstreamTransport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, upstreamAddr)
+		},
+	}
+	defer func() { upstreamTransport = origTransport }()
+
+	proxyURL, err := url.Parse("http://" + httpAddr)
+	require.NoError(t, err)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs: caPool,
+			},
+		},
+	}
+
+	resp, err := client.Get("https://" + fakeHost + "/through-connect")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "hello from explicit connect", string(body))
+}
+
+func TestExplicitHTTPSProxy_CONNECT_RewritesSecrets(t *testing.T) {
+	const (
+		fakeHost   = "api.openai.com"
+		proxyToken = "proxy-openai-abc123"
+		realSecret = "sk-real-value"
+	)
+	t.Setenv("OPENAI_API_KEY", realSecret)
+
+	pipeline := buildPipeline(t, `
+transforms:
+  - name: allowlist
+    config:
+      domains:
+        - "api.openai.com"
+  - name: secrets
+    config:
+      source: env
+      secrets:
+        - var: OPENAI_API_KEY
+          proxy_value: "proxy-openai-abc123"
+          match_headers: ["Authorization"]
+          hosts:
+            - name: "api.openai.com"
+`)
+
+	var gotAuth string
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprint(w, "rewritten")
+	}))
+	defer upstream.Close()
+
+	_, httpAddr, _, caPool := startProxyWithPipeline(t, pipeline)
+	upstreamAddr := upstream.Listener.Addr().String()
+
+	origTransport := upstreamTransport
+	upstreamTransport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, upstreamAddr)
+		},
+	}
+	defer func() { upstreamTransport = origTransport }()
+
+	proxyURL, err := url.Parse("http://" + httpAddr)
+	require.NoError(t, err)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs: caPool,
+			},
+		},
+	}
+
+	req, err := http.NewRequest("GET", "https://"+fakeHost+"/v1/models", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+proxyToken)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "Bearer "+realSecret, gotAuth)
 }
 
 func TestHTTPProxy_UpstreamError(t *testing.T) {
