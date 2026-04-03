@@ -11,12 +11,12 @@ import (
 
 // Config is the top-level configuration for iron-proxy.
 type Config struct {
-	DNS        DNS        `yaml:"dns"`
-	Proxy      Proxy      `yaml:"proxy"`
-	TLS        TLS        `yaml:"tls"`
+	DNS        DNS         `yaml:"dns"`
+	Proxy      Proxy       `yaml:"proxy"`
+	TLS        TLS         `yaml:"tls"`
 	Transforms []Transform `yaml:"transforms"`
-	Metrics    Metrics    `yaml:"metrics"`
-	Log        Log        `yaml:"log"`
+	Metrics    Metrics     `yaml:"metrics"`
+	Log        Log         `yaml:"log"`
 }
 
 // DNS configures the built-in DNS server.
@@ -42,10 +42,10 @@ type Proxy struct {
 
 // TLS configures certificate authority and cert caching for MITM.
 type TLS struct {
-	CACert             string `yaml:"ca_cert"`
-	CAKey              string `yaml:"ca_key"`
-	CertCacheSize      int    `yaml:"cert_cache_size"`
-	LeafCertExpiryHours int   `yaml:"leaf_cert_expiry_hours"`
+	CACert              string `yaml:"ca_cert"`
+	CAKey               string `yaml:"ca_key"`
+	CertCacheSize       int    `yaml:"cert_cache_size"`
+	LeafCertExpiryHours int    `yaml:"leaf_cert_expiry_hours"`
 }
 
 // Transform is a named transform with arbitrary config.
@@ -116,10 +116,18 @@ func applyDefaults(cfg *Config) {
 	if cfg.Log.Level == "" {
 		cfg.Log.Level = "info"
 	}
+
+	cfg.DNS.Listen = normalizeOptionalListen(cfg.DNS.Listen)
+	cfg.Proxy.HTTPListen = normalizeOptionalListen(cfg.Proxy.HTTPListen)
+	cfg.Proxy.HTTPSListen = normalizeOptionalListen(cfg.Proxy.HTTPSListen)
+	cfg.Metrics.Listen = normalizeOptionalListen(cfg.Metrics.Listen)
 }
 
 func validate(cfg *Config) error {
-	if cfg.DNS.ProxyIP == "" {
+	if cfg.Proxy.HTTPListen == "" && cfg.Proxy.HTTPSListen == "" {
+		return fmt.Errorf("at least one proxy listener must be enabled")
+	}
+	if cfg.DNS.Listen != "" && cfg.DNS.ProxyIP == "" {
 		return fmt.Errorf("dns.proxy_ip is required")
 	}
 	if cfg.TLS.CACert == "" {
@@ -147,4 +155,13 @@ func validate(cfg *Config) error {
 	}
 
 	return nil
+}
+
+func normalizeOptionalListen(value string) string {
+	switch value {
+	case "off", "OFF", "disabled", "DISABLED", "none", "NONE", "-", "false", "FALSE":
+		return ""
+	default:
+		return value
+	}
 }

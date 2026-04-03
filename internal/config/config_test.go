@@ -66,6 +66,28 @@ log:
 	require.Equal(t, "debug", cfg.Log.Level)
 }
 
+func TestLoad_DisabledOptionalListeners(t *testing.T) {
+	yaml := `
+dns:
+  listen: "off"
+  proxy_ip: "10.0.0.1"
+proxy:
+  http_listen: ":8080"
+  https_listen: "off"
+metrics:
+  listen: "off"
+tls:
+  ca_cert: "/etc/ca.crt"
+  ca_key: "/etc/ca.key"
+`
+	cfg, err := Load(strings.NewReader(yaml))
+	require.NoError(t, err)
+	require.Equal(t, "", cfg.DNS.Listen)
+	require.Equal(t, ":8080", cfg.Proxy.HTTPListen)
+	require.Equal(t, "", cfg.Proxy.HTTPSListen)
+	require.Equal(t, "", cfg.Metrics.Listen)
+}
+
 func TestLoad_ValidationErrors(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -80,6 +102,20 @@ tls:
   ca_key: "/tmp/ca.key"
 `,
 			wantErr: "dns.proxy_ip is required",
+		},
+		{
+			name: "all proxy listeners disabled",
+			yaml: `
+dns:
+  listen: "off"
+proxy:
+  http_listen: "off"
+  https_listen: "off"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`,
+			wantErr: "at least one proxy listener must be enabled",
 		},
 		{
 			name: "missing ca_cert",

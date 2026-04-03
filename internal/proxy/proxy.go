@@ -56,23 +56,34 @@ func New(httpAddr, httpsAddr string, certCache *certcache.Cache, pipeline *trans
 // both servers have stopped.
 func (p *Proxy) ListenAndServe() error {
 	errc := make(chan error, 2)
+	started := 0
 
-	go func() {
-		p.logger.Info("http proxy starting", slog.String("addr", p.httpServer.Addr))
-		errc <- fmt.Errorf("http: %w", p.httpServer.ListenAndServe())
-	}()
+	if p.httpServer.Addr != "" {
+		started++
+		go func() {
+			p.logger.Info("http proxy starting", slog.String("addr", p.httpServer.Addr))
+			errc <- fmt.Errorf("http: %w", p.httpServer.ListenAndServe())
+		}()
+	}
 
-	go func() {
-		ln, err := net.Listen("tcp", p.httpsServer.Addr)
-		if err != nil {
-			errc <- fmt.Errorf("https listen: %w", err)
-			return
-		}
-		tlsLn := tls.NewListener(ln, p.httpsServer.TLSConfig)
-		p.tlsListener = tlsLn
-		p.logger.Info("https proxy starting", slog.String("addr", ln.Addr().String()))
-		errc <- fmt.Errorf("https: %w", p.httpsServer.Serve(tlsLn))
-	}()
+	if p.httpsServer.Addr != "" {
+		started++
+		go func() {
+			ln, err := net.Listen("tcp", p.httpsServer.Addr)
+			if err != nil {
+				errc <- fmt.Errorf("https listen: %w", err)
+				return
+			}
+			tlsLn := tls.NewListener(ln, p.httpsServer.TLSConfig)
+			p.tlsListener = tlsLn
+			p.logger.Info("https proxy starting", slog.String("addr", ln.Addr().String()))
+			errc <- fmt.Errorf("https: %w", p.httpsServer.Serve(tlsLn))
+		}()
+	}
+
+	if started == 0 {
+		return fmt.Errorf("no proxy listeners configured")
+	}
 
 	return <-errc
 }

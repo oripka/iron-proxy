@@ -74,11 +74,13 @@ func main() {
 	pipeline := transform.NewPipeline(transformers, logger)
 	pipeline.SetAuditFunc(transform.NewAuditLogger(logger))
 
-	// Initialize DNS server
-	dnsServer, err := idns.New(cfg.DNS, net.DefaultResolver, logger)
-	if err != nil {
-		logger.Error("initializing DNS server", slog.String("error", err.Error()))
-		os.Exit(1)
+	var dnsServer *idns.Server
+	if cfg.DNS.Listen != "" {
+		dnsServer, err = idns.New(cfg.DNS, net.DefaultResolver, logger)
+		if err != nil {
+			logger.Error("initializing DNS server", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
 	}
 
 	// Initialize proxy
@@ -87,7 +89,9 @@ func main() {
 	// Start services
 	errc := make(chan error, 2)
 
-	go func() { errc <- fmt.Errorf("dns: %w", dnsServer.ListenAndServe()) }()
+	if dnsServer != nil {
+		go func() { errc <- fmt.Errorf("dns: %w", dnsServer.ListenAndServe()) }()
+	}
 	go func() { errc <- fmt.Errorf("proxy: %w", p.ListenAndServe()) }()
 
 	logger.Info("iron-proxy starting",
@@ -114,8 +118,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := dnsServer.Shutdown(ctx); err != nil {
-		logger.Error("dns shutdown error", slog.String("error", err.Error()))
+	if dnsServer != nil {
+		if err := dnsServer.Shutdown(ctx); err != nil {
+			logger.Error("dns shutdown error", slog.String("error", err.Error()))
+		}
 	}
 	if err := p.Shutdown(ctx); err != nil {
 		logger.Error("proxy shutdown error", slog.String("error", err.Error()))
