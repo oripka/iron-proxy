@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,20 +21,28 @@ import (
 
 // Proxy is the HTTP/HTTPS MITM proxy server.
 type Proxy struct {
-	httpServer  *http.Server
-	httpsServer *http.Server
-	tlsListener net.Listener
-	certCache   *certcache.Cache
-	pipeline    *transform.Pipeline
-	logger      *slog.Logger
+	httpServer     *http.Server
+	httpsServer    *http.Server
+	tlsListener    net.Listener
+	tunnelAddr     string
+	tunnelListener net.Listener
+	tunnelDone     chan struct{}
+	certCache      *certcache.Cache
+	pipeline       *transform.PipelineHolder
+	transport      *http.Transport
+	logger         *slog.Logger
 }
 
-// New creates a new Proxy.
-func New(httpAddr, httpsAddr string, certCache *certcache.Cache, pipeline *transform.Pipeline, logger *slog.Logger) *Proxy {
+// New creates a new Proxy. If resolver is non-nil, it is used to resolve
+// upstream hostnames instead of the OS default resolver.
+func New(httpAddr, httpsAddr, tunnelAddr string, certCache *certcache.Cache, pipeline *transform.PipelineHolder, resolver *net.Resolver, logger *slog.Logger) *Proxy {
 	p := &Proxy{
-		certCache: certCache,
-		pipeline:  pipeline,
-		logger:    logger,
+		tunnelAddr: tunnelAddr,
+		tunnelDone: make(chan struct{}),
+		certCache:  certCache,
+		pipeline:   pipeline,
+		transport:  buildTransport(resolver),
+		logger:     logger,
 	}
 
 	p.httpServer = &http.Server{
@@ -52,22 +61,38 @@ func New(httpAddr, httpsAddr string, certCache *certcache.Cache, pipeline *trans
 	return p
 }
 
-// ListenAndServe starts both HTTP and HTTPS listeners. It blocks until
-// both servers have stopped.
+// ListenAndServe starts the HTTP, HTTPS, and (optionally) tunnel listeners.
+// It blocks until any server has stopped.
 func (p *Proxy) ListenAndServe() error {
-	errc := make(chan error, 2)
-	started := 0
+	listeners := 0
+	if p.httpServer.Addr != "" {
+		listeners++
+	}
+	if p.httpsServer.Addr != "" {
+		listeners++
+	}
+	if p.tunnelAddr != "" {
+		listeners++
+	}
+	if listeners == 0 {
+		return fmt.Errorf("no proxy listeners configured")
+	}
+
+	errc := make(chan error, listeners)
 
 	if p.httpServer.Addr != "" {
-		started++
 		go func() {
-			p.logger.Info("http proxy starting", slog.String("addr", p.httpServer.Addr))
-			errc <- fmt.Errorf("http: %w", p.httpServer.ListenAndServe())
+			ln, err := net.Listen("tcp", p.httpServer.Addr)
+			if err != nil {
+				errc <- fmt.Errorf("http listen: %w", err)
+				return
+			}
+			p.logger.Info("http proxy starting", slog.String("addr", ln.Addr().String()))
+			errc <- fmt.Errorf("http: %w", p.httpServer.Serve(ln))
 		}()
 	}
 
 	if p.httpsServer.Addr != "" {
-		started++
 		go func() {
 			ln, err := net.Listen("tcp", p.httpsServer.Addr)
 			if err != nil {
@@ -81,17 +106,26 @@ func (p *Proxy) ListenAndServe() error {
 		}()
 	}
 
-	if started == 0 {
-		return fmt.Errorf("no proxy listeners configured")
+	if p.tunnelAddr != "" {
+		go func() {
+			errc <- fmt.Errorf("tunnel: %w", p.listenTunnel())
+		}()
 	}
 
 	return <-errc
 }
 
-// Shutdown gracefully stops both servers.
+// Shutdown gracefully stops all servers.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	errHTTP := p.httpServer.Shutdown(ctx)
 	errHTTPS := p.httpsServer.Shutdown(ctx)
+
+	// Signal tunnel accept loop to stop, then close the listener.
+	close(p.tunnelDone)
+	if p.tunnelListener != nil {
+		p.tunnelListener.Close()
+	}
+
 	if errHTTP != nil {
 		return errHTTP
 	}
@@ -138,8 +172,13 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Snapshot the pipeline for this request so a concurrent swap does not
+	// affect in-flight processing.
+	pl := p.pipeline.Load()
+
 	// Build transform context and audit state
 	startedAt := time.Now()
+	bodyLimits := pl.BodyLimits()
 	tctx := &transform.TransformContext{
 		Logger: p.logger,
 	}
@@ -160,11 +199,14 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		result.Duration = time.Since(startedAt)
 		result.RequestTransforms = reqTraces
 		result.ResponseTransforms = respTraces
-		p.pipeline.EmitAudit(result)
+		pl.EmitAudit(result)
 	}()
 
+	// Wrap request body for lazy buffering by transforms.
+	r.Body = transform.NewBufferedBody(r.Body, bodyLimits.MaxRequestBodyBytes)
+
 	// Run request transforms
-	if rejectResp, err := p.pipeline.ProcessRequest(r.Context(), tctx, r, &reqTraces); err != nil {
+	if rejectResp, err := pl.ProcessRequest(r.Context(), tctx, r, &reqTraces); err != nil {
 		result.Action = transform.ActionContinue // error, not reject
 		result.StatusCode = http.StatusBadGateway
 		result.Err = err
@@ -173,7 +215,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if rejectResp != nil {
 		result.Action = transform.ActionReject
 		result.StatusCode = rejectResp.StatusCode
-		writeResponse(w, rejectResp)
+		p.writeResponse(w, rejectResp)
 		return
 	}
 
@@ -192,7 +234,11 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		path = path + "?" + r.URL.RawQuery
 	}
 	upstreamURL := fmt.Sprintf("%s://%s%s", scheme, host, path)
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, r.Body)
+
+	reqBody := transform.RequireBufferedBody(r.Body)
+	// Check Len() before StreamingReader(), which clears the original reader.
+	reqBodyLen := reqBody.Len()
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, io.NopCloser(reqBody.StreamingReader()))
 	if err != nil {
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway
@@ -201,6 +247,14 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyHeaders(upstreamReq.Header, r.Header)
+	// If a transform buffered the request body, set ContentLength so the
+	// upstream receives a Content-Length header instead of chunked encoding.
+	// Otherwise, preserve the original Content-Length from the client.
+	if reqBodyLen >= 0 {
+		upstreamReq.ContentLength = int64(reqBodyLen)
+	} else {
+		upstreamReq.ContentLength = r.ContentLength
+	}
 
 	resp, err := p.doUpstream(upstreamReq)
 	if err != nil {
@@ -212,8 +266,11 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// Wrap response body for lazy buffering by transforms.
+	resp.Body = transform.NewBufferedBody(resp.Body, bodyLimits.MaxResponseBodyBytes)
+
 	// Run response transforms
-	finalResp, err := p.pipeline.ProcessResponse(r.Context(), tctx, r, resp, &respTraces)
+	finalResp, err := pl.ProcessResponse(r.Context(), tctx, r, resp, &respTraces)
 	if err != nil {
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway
@@ -231,7 +288,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeResponse(w, finalResp)
+	p.writeResponse(w, finalResp)
 }
 
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -389,7 +446,9 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(upstreamConn, clientBuf)
+		if _, err := io.Copy(upstreamConn, clientBuf); err != nil {
+			p.logger.Debug("websocket client->upstream copy error", slog.String("error", err.Error()))
+		}
 		// Signal upstream we're done writing
 		if tc, ok := upstreamConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -398,7 +457,9 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(clientConn, upstreamConn)
+		if _, err := io.Copy(clientConn, upstreamConn); err != nil {
+			p.logger.Debug("websocket upstream->client copy error", slog.String("error", err.Error()))
+		}
 		// Signal client we're done writing
 		if tc, ok := clientConn.(*net.TCPConn); ok {
 			tc.CloseWrite()
@@ -423,52 +484,83 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
+	reader := transform.RequireBufferedBody(resp.Body).StreamingReader()
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		// Fallback to regular copy if flushing isn't supported
-		_, _ = io.Copy(w, resp.Body)
+		if _, err := io.Copy(w, reader); err != nil {
+			p.logger.Warn("SSE copy error", slog.String("error", err.Error()))
+		}
 		return
 	}
 
 	buf := make([]byte, 32*1024)
 	for {
-		n, err := resp.Body.Read(buf)
+		n, readErr := reader.Read(buf)
 		if n > 0 {
-			_, _ = w.Write(buf[:n])
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				p.logger.Warn("SSE write error", slog.String("error", writeErr.Error()))
+				break
+			}
 			flusher.Flush()
 		}
-		if err != nil {
+		if readErr != nil {
+			if readErr != io.EOF {
+				p.logger.Warn("SSE read error", slog.String("error", readErr.Error()))
+			}
 			break
 		}
 	}
 }
 
-func writeResponse(w http.ResponseWriter, resp *http.Response) {
+func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
 	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	if resp.Body != nil {
-		_, _ = io.Copy(w, resp.Body)
+	if buf, ok := resp.Body.(*transform.BufferedBody); ok {
+		// If a transform buffered the response body, set Content-Length
+		// from the buffered data. Otherwise preserve the upstream header
+		// as-is so clients that require Content-Length (e.g. Docker)
+		// work correctly.
+		if n := buf.Len(); n >= 0 {
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(n), 10))
+		}
+		w.WriteHeader(resp.StatusCode)
+		if _, err := io.Copy(w, buf.StreamingReader()); err != nil {
+			p.logger.Warn("response body copy error", slog.String("error", err.Error()))
+		}
+	} else {
+		// Synthetic responses (e.g. reject) with plain bodies.
+		w.WriteHeader(resp.StatusCode)
+		if resp.Body != nil {
+			if _, err := io.Copy(w, resp.Body); err != nil {
+				p.logger.Warn("response body copy error", slog.String("error", err.Error()))
+			}
+		}
 	}
 }
 
-// upstreamTransport is the transport used for upstream requests.
-// Separate from http.DefaultTransport so proxy settings don't loop.
-var upstreamTransport = &http.Transport{
-	TLSClientConfig: &tls.Config{
-		MinVersion: tls.VersionTLS12,
-	},
-	DialContext: (&net.Dialer{
+// buildTransport creates the HTTP transport used for upstream requests.
+// If resolver is non-nil, the transport's dialer uses it instead of the OS
+// default — this prevents resolution loops when iron-proxy owns the system DNS.
+func buildTransport(resolver *net.Resolver) *http.Transport {
+	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
-	}).DialContext,
-	MaxIdleConns:          100,
-	IdleConnTimeout:       90 * time.Second,
-	TLSHandshakeTimeout:   10 * time.Second,
-	ResponseHeaderTimeout: 30 * time.Second,
+		Resolver:  resolver,
+	}
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+		DialContext:           dialer.DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
 }
 
 func (p *Proxy) doUpstream(req *http.Request) (*http.Response, error) {
-	return upstreamTransport.RoundTrip(req)
+	return p.transport.RoundTrip(req)
 }
 
 func copyHeaders(dst, src http.Header) {

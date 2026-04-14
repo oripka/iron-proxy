@@ -21,10 +21,11 @@ type Config struct {
 
 // DNS configures the built-in DNS server.
 type DNS struct {
-	Listen      string      `yaml:"listen"`
-	ProxyIP     string      `yaml:"proxy_ip"`
-	Passthrough []string    `yaml:"passthrough"`
-	Records     []DNSRecord `yaml:"records"`
+	Listen           string      `yaml:"listen"`
+	ProxyIP          string      `yaml:"proxy_ip"`
+	UpstreamResolver string      `yaml:"upstream_resolver"`
+	Passthrough      []string    `yaml:"passthrough"`
+	Records          []DNSRecord `yaml:"records"`
 }
 
 // DNSRecord is a static DNS record entry.
@@ -36,8 +37,11 @@ type DNSRecord struct {
 
 // Proxy configures the HTTP/HTTPS listener addresses.
 type Proxy struct {
-	HTTPListen  string `yaml:"http_listen"`
-	HTTPSListen string `yaml:"https_listen"`
+	HTTPListen           string `yaml:"http_listen"`
+	HTTPSListen          string `yaml:"https_listen"`
+	TunnelListen         string `yaml:"tunnel_listen"`
+	MaxRequestBodyBytes  int64  `yaml:"max_request_body_bytes"`
+	MaxResponseBodyBytes int64  `yaml:"max_response_body_bytes"`
 }
 
 // TLS configures certificate authority and cert caching for MITM.
@@ -65,8 +69,15 @@ type Log struct {
 	Level string `yaml:"level"`
 }
 
-// LoadFile reads and parses a YAML config file at the given path.
+// LoadFile reads and parses a YAML config from the given path. If the path is
+// an S3 URL (s3://bucket/key), the config is fetched from S3 using the default
+// AWS credential chain.
 func LoadFile(path string) (*Config, error) {
+	return loadFileOrS3(path)
+}
+
+// loadFromFile reads and parses a YAML config file from a local filesystem path.
+func loadFromFile(path string) (*Config, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("opening config file: %w", err)
@@ -104,6 +115,10 @@ func applyDefaults(cfg *Config) {
 	if cfg.Proxy.HTTPSListen == "" {
 		cfg.Proxy.HTTPSListen = ":443"
 	}
+	if cfg.Proxy.MaxRequestBodyBytes == 0 {
+		cfg.Proxy.MaxRequestBodyBytes = 1 << 20 // 1 MiB
+	}
+	// MaxResponseBodyBytes defaults to 0 (uncapped).
 	if cfg.TLS.CertCacheSize == 0 {
 		cfg.TLS.CertCacheSize = 1000
 	}

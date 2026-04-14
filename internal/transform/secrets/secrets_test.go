@@ -3,37 +3,95 @@ package secrets
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
+	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
 )
 
+// fakeResolver is a test secretResolver that returns preconfigured values.
+type fakeResolver struct {
+	secrets map[string]string // keyed by env var name or secret ID
+}
+
+func (f *fakeResolver) Resolve(_ context.Context, raw yaml.Node) (ResolveResult, error) {
+	// Try env config first, then aws_sm config.
+	var env envConfig
+	if err := raw.Decode(&env); err == nil && env.Var != "" {
+		val, ok := f.secrets[env.Var]
+		if !ok || val == "" {
+			return ResolveResult{}, &resolveError{env.Var}
+		}
+		return ResolveResult{Name: env.Var, GetValue: staticValue(val)}, nil
+	}
+	var sm awsSMConfig
+	if err := raw.Decode(&sm); err == nil && sm.SecretID != "" {
+		val, ok := f.secrets[sm.SecretID]
+		if !ok || val == "" {
+			return ResolveResult{}, &resolveError{sm.SecretID}
+		}
+		return ResolveResult{Name: sm.SecretID, GetValue: staticValue(val)}, nil
+	}
+	return ResolveResult{}, &resolveError{"unknown"}
+}
+
+type resolveError struct{ name string }
+
+func (e *resolveError) Error() string { return e.name + " not found" }
+
+func testRegistry() resolverRegistry {
+	return resolverRegistry{
+		"env": &fakeResolver{secrets: map[string]string{
+			"OPENAI_API_KEY":    "sk-real-openai-key",
+			"ANTHROPIC_API_KEY": "sk-real-anthropic-key",
+			"INTERNAL_TOKEN":    "real-internal-token",
+		}},
+		"aws_sm": &fakeResolver{secrets: map[string]string{
+			"arn:aws:sm:test": "aws-secret-value",
+		}},
+	}
+}
+
+func envSource(varName string) yaml.Node {
+	return yamlNode(&testing.T{}, map[string]string{"type": "env", "var": varName})
+}
+
+func awsSMSource(secretID string) yaml.Node {
+	return yamlNode(&testing.T{}, map[string]string{"type": "aws_sm", "secret_id": secretID})
+}
+
+// defaultEntry returns the most common secretEntry used across tests.
+// Use the opts functions to override specific fields.
+func defaultEntry(opts ...func(*secretEntry)) secretEntry {
+	e := secretEntry{
+		Source:       envSource("OPENAI_API_KEY"),
+		ProxyValue:   "proxy-openai-abc123",
+		MatchHeaders: []string{"Authorization"},
+		Rules:        []hostmatch.RuleConfig{{Host: "api.openai.com"}},
+	}
+	for _, opt := range opts {
+		opt(&e)
+	}
+	return e
+}
+
 func makeSecrets(t *testing.T, entries []secretEntry) *Secrets {
 	t.Helper()
-	cfg := secretsConfig{
-		Source:  "env",
-		Secrets: entries,
-	}
-	getenv := func(key string) string {
-		switch key {
-		case "OPENAI_API_KEY":
-			return "sk-real-openai-key"
-		case "ANTHROPIC_API_KEY":
-			return "sk-real-anthropic-key"
-		case "INTERNAL_TOKEN":
-			return "real-internal-token"
-		default:
-			return ""
-		}
-	}
-	s, err := newFromConfig(cfg, getenv)
+	cfg := secretsConfig{Secrets: entries}
+	s, err := newFromConfig(context.Background(), cfg, testRegistry())
 	require.NoError(t, err)
 	return s
 }
@@ -45,16 +103,16 @@ func doTransform(t *testing.T, s *Secrets, req *http.Request) {
 	require.Equal(t, transform.ActionContinue, res.Action)
 }
 
-func TestSecrets_HeaderSwap(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{"Authorization"},
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
-
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
+func openaiReq(method, path string) *http.Request {
+	req := httptest.NewRequest(method, "http://api.openai.com"+path, nil)
 	req.Host = "api.openai.com"
+	return req
+}
+
+func TestSecrets_HeaderSwap(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry()})
+
+	req := openaiReq("GET", "/v1/chat")
 	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
 
 	doTransform(t, s, req)
@@ -63,11 +121,9 @@ func TestSecrets_HeaderSwap(t *testing.T) {
 }
 
 func TestSecrets_QueryParamSwap(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:        "OPENAI_API_KEY",
-		ProxyValue: "proxy-openai-abc123",
-		Hosts:      []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = nil
+	})})
 
 	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat?token=proxy-openai-abc123&other=value", nil)
 	req.Host = "api.openai.com"
@@ -80,18 +136,15 @@ func TestSecrets_QueryParamSwap(t *testing.T) {
 }
 
 func TestSecrets_BodySwap(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:        "OPENAI_API_KEY",
-		ProxyValue: "proxy-openai-abc123",
-		MatchBody:  true,
-		Hosts:      []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = nil
+		e.MatchBody = true
+	})})
 
 	body := `{"api_key": "proxy-openai-abc123", "model": "gpt-4"}`
-	rb := transform.NewReplayableBody(io.NopCloser(strings.NewReader(body)))
+	rb := transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
 
-	req := httptest.NewRequest("POST", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("POST", "/v1/chat")
 	req.Body = rb
 	req.ContentLength = int64(len(body))
 
@@ -105,15 +158,9 @@ func TestSecrets_BodySwap(t *testing.T) {
 }
 
 func TestSecrets_HostMatch(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{"Authorization"},
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry()})
 
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("GET", "/v1/chat")
 	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
 
 	doTransform(t, s, req)
@@ -121,12 +168,7 @@ func TestSecrets_HostMatch(t *testing.T) {
 }
 
 func TestSecrets_HostNoMatch(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{"Authorization"},
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry()})
 
 	req := httptest.NewRequest("GET", "http://evil.com/steal", nil)
 	req.Host = "evil.com"
@@ -139,12 +181,12 @@ func TestSecrets_HostNoMatch(t *testing.T) {
 }
 
 func TestSecrets_WildcardHost(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "ANTHROPIC_API_KEY",
-		ProxyValue:   "proxy-anthropic-xyz789",
-		MatchHeaders: []string{"X-Api-Key"},
-		Hosts:        []hostMatch{{Name: "*.anthropic.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.Source = envSource("ANTHROPIC_API_KEY")
+		e.ProxyValue = "proxy-anthropic-xyz789"
+		e.MatchHeaders = []string{"X-Api-Key"}
+		e.Rules = []hostmatch.RuleConfig{{Host: "*.anthropic.com"}}
+	})})
 
 	req := httptest.NewRequest("GET", "http://api.anthropic.com/v1/messages", nil)
 	req.Host = "api.anthropic.com"
@@ -156,22 +198,15 @@ func TestSecrets_WildcardHost(t *testing.T) {
 
 func TestSecrets_MultipleSecrets(t *testing.T) {
 	s := makeSecrets(t, []secretEntry{
-		{
-			Var:          "OPENAI_API_KEY",
-			ProxyValue:   "proxy-openai-abc123",
-			MatchHeaders: []string{"Authorization"},
-			Hosts:        []hostMatch{{Name: "api.openai.com"}},
-		},
-		{
-			Var:          "INTERNAL_TOKEN",
-			ProxyValue:   "proxy-internal-tok",
-			MatchHeaders: []string{"X-Internal"},
-			Hosts:        []hostMatch{{Name: "api.openai.com"}},
-		},
+		defaultEntry(),
+		defaultEntry(func(e *secretEntry) {
+			e.Source = envSource("INTERNAL_TOKEN")
+			e.ProxyValue = "proxy-internal-tok"
+			e.MatchHeaders = []string{"X-Internal"}
+		}),
 	})
 
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("GET", "/v1/chat")
 	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
 	req.Header.Set("X-Internal", "proxy-internal-tok")
 
@@ -182,15 +217,9 @@ func TestSecrets_MultipleSecrets(t *testing.T) {
 }
 
 func TestSecrets_MatchHeadersFiltering(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{"Authorization"},
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry()})
 
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("GET", "/v1/chat")
 	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
 	req.Header.Set("X-Custom", "proxy-openai-abc123") // not in match_headers
 
@@ -202,15 +231,11 @@ func TestSecrets_MatchHeadersFiltering(t *testing.T) {
 }
 
 func TestSecrets_EmptyMatchHeadersSearchesAll(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{}, // empty = all headers
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{} // empty = all headers
+	})})
 
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("GET", "/v1/chat")
 	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
 	req.Header.Set("X-Custom", "proxy-openai-abc123")
 
@@ -220,81 +245,77 @@ func TestSecrets_EmptyMatchHeadersSearchesAll(t *testing.T) {
 	require.Equal(t, "sk-real-openai-key", req.Header.Get("X-Custom"))
 }
 
-func TestSecrets_MissingEnvVar(t *testing.T) {
-	cfg := secretsConfig{
-		Source: "env",
-		Secrets: []secretEntry{{
-			Var:        "NONEXISTENT_VAR",
-			ProxyValue: "proxy-value",
-			Hosts:      []hostMatch{{Name: "example.com"}},
-		}},
+func TestSecrets_ConfigErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		cfg    secretsConfig
+		errMsg string
+	}{
+		{
+			name: "missing env var",
+			cfg: secretsConfig{Secrets: []secretEntry{{
+				Source:     envSource("NONEXISTENT_VAR"),
+				ProxyValue: "proxy-value",
+				Rules:      []hostmatch.RuleConfig{{Host: "example.com"}},
+			}}},
+			errMsg: "NONEXISTENT_VAR",
+		},
+		{
+			name: "empty proxy value",
+			cfg: secretsConfig{Secrets: []secretEntry{{
+				Source:     envSource("OPENAI_API_KEY"),
+				ProxyValue: "",
+				Rules:      []hostmatch.RuleConfig{{Host: "example.com"}},
+			}}},
+			errMsg: "proxy_value is required",
+		},
+		{
+			name: "unsupported source type",
+			cfg: secretsConfig{Secrets: []secretEntry{{
+				Source:     yamlNode(&testing.T{}, map[string]string{"type": "vault"}),
+				ProxyValue: "proxy-value",
+				Rules:      []hostmatch.RuleConfig{{Host: "example.com"}},
+			}}},
+			errMsg: "unsupported source type",
+		},
+		{
+			name: "missing source type",
+			cfg: secretsConfig{Secrets: []secretEntry{{
+				Source:     yamlNode(&testing.T{}, map[string]string{"var": "FOO"}),
+				ProxyValue: "proxy-value",
+				Rules:      []hostmatch.RuleConfig{{Host: "example.com"}},
+			}}},
+			errMsg: "source.type is required",
+		},
 	}
-	getenv := func(string) string { return "" }
-
-	_, err := newFromConfig(cfg, getenv)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "NONEXISTENT_VAR")
-	require.Contains(t, err.Error(), "not set or empty")
-}
-
-func TestSecrets_EmptyProxyValue(t *testing.T) {
-	cfg := secretsConfig{
-		Source: "env",
-		Secrets: []secretEntry{{
-			Var:        "OPENAI_API_KEY",
-			ProxyValue: "",
-			Hosts:      []hostMatch{{Name: "example.com"}},
-		}},
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := newFromConfig(context.Background(), tt.cfg, testRegistry())
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tt.errMsg)
+		})
 	}
-	getenv := func(string) string { return "real-value" }
-
-	_, err := newFromConfig(cfg, getenv)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "proxy_value is required")
-}
-
-func TestSecrets_UnsupportedSource(t *testing.T) {
-	cfg := secretsConfig{
-		Source:  "vault",
-		Secrets: nil,
-	}
-	_, err := newFromConfig(cfg, func(string) string { return "" })
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "unsupported secrets source")
 }
 
 func TestSecrets_BodyTooLarge(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:        "OPENAI_API_KEY",
-		ProxyValue: "proxy-openai-abc123",
-		MatchBody:  true,
-		Hosts:      []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = nil
+		e.MatchBody = true
+	})})
 
-	// Create a body larger than defaultBodyMaxBytes (1MB)
-	bigBody := strings.Repeat("x", int(defaultBodyMaxBytes)+100)
-	rb := transform.NewReplayableBody(io.NopCloser(strings.NewReader(bigBody)))
+	// Create a body larger than the max (1 MiB)
+	bigBody := strings.Repeat("x", (1<<20)+100)
+	rb := transform.NewBufferedBody(io.NopCloser(strings.NewReader(bigBody)), 1<<20)
 
-	req := httptest.NewRequest("POST", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("POST", "/v1/chat")
 	req.Body = rb
 
 	// Should not error — just skip body substitution
 	doTransform(t, s, req)
-
-	// Body should be unchanged (not buffered, so reads from original)
-	// The ReplayableBody couldn't buffer, so reading it gives nothing useful
-	// since the original reader was partially consumed by the Buffer attempt.
-	// The key assertion is that the transform didn't error or reject.
 }
 
 func TestSecrets_HostWithPort(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{"Authorization"},
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry()})
 
 	req := httptest.NewRequest("GET", "http://api.openai.com:443/v1/chat", nil)
 	req.Host = "api.openai.com:443"
@@ -306,11 +327,9 @@ func TestSecrets_HostWithPort(t *testing.T) {
 }
 
 func TestSecrets_ResponseIsNoop(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:        "OPENAI_API_KEY",
-		ProxyValue: "proxy-openai-abc123",
-		Hosts:      []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = nil
+	})})
 
 	req := httptest.NewRequest("GET", "http://example.com/", nil)
 	resp := &http.Response{StatusCode: http.StatusOK}
@@ -320,20 +339,14 @@ func TestSecrets_ResponseIsNoop(t *testing.T) {
 }
 
 func TestSecrets_ConcurrentSafety(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{"Authorization"},
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry()})
 
 	var wg sync.WaitGroup
 	for range 50 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
-			req.Host = "api.openai.com"
+			req := openaiReq("GET", "/v1/chat")
 			req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
 
 			doTransform(t, s, req)
@@ -345,17 +358,11 @@ func TestSecrets_ConcurrentSafety(t *testing.T) {
 }
 
 func TestSecrets_BasicAuthSwap(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{"Authorization"},
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry()})
 
 	// Basic auth: "user:proxy-openai-abc123" base64-encoded
 	creds := base64.StdEncoding.EncodeToString([]byte("user:proxy-openai-abc123"))
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("GET", "/v1/chat")
 	req.Header.Set("Authorization", "Basic "+creds)
 
 	doTransform(t, s, req)
@@ -368,17 +375,11 @@ func TestSecrets_BasicAuthSwap(t *testing.T) {
 }
 
 func TestSecrets_BasicAuthNoMatch(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{"Authorization"},
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry()})
 
 	// Basic auth with no proxy token inside
 	creds := base64.StdEncoding.EncodeToString([]byte("user:some-other-password"))
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("GET", "/v1/chat")
 	req.Header.Set("Authorization", "Basic "+creds)
 
 	doTransform(t, s, req)
@@ -388,16 +389,12 @@ func TestSecrets_BasicAuthNoMatch(t *testing.T) {
 }
 
 func TestSecrets_BasicAuthAllHeaders(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{}, // all headers
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{} // all headers
+	})})
 
 	creds := base64.StdEncoding.EncodeToString([]byte("proxy-openai-abc123:secret"))
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("GET", "/v1/chat")
 	req.Header.Set("Authorization", "Basic "+creds)
 
 	doTransform(t, s, req)
@@ -409,17 +406,13 @@ func TestSecrets_BasicAuthAllHeaders(t *testing.T) {
 }
 
 func TestSecrets_BasicAuthIgnoredOnNonAuthHeader(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{{
-		Var:          "OPENAI_API_KEY",
-		ProxyValue:   "proxy-openai-abc123",
-		MatchHeaders: []string{}, // all headers
-		Hosts:        []hostMatch{{Name: "api.openai.com"}},
-	}})
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{} // all headers
+	})})
 
 	// "Basic <base64>" on a non-Authorization header should not be decoded
 	creds := base64.StdEncoding.EncodeToString([]byte("proxy-openai-abc123:secret"))
-	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat", nil)
-	req.Host = "api.openai.com"
+	req := openaiReq("GET", "/v1/chat")
 	req.Header.Set("X-Custom", "Basic "+creds)
 
 	doTransform(t, s, req)
@@ -428,7 +421,351 @@ func TestSecrets_BasicAuthIgnoredOnNonAuthHeader(t *testing.T) {
 	require.Equal(t, "Basic "+creds, req.Header.Get("X-Custom"))
 }
 
+func TestSecrets_RequireRejectsWithoutProxyToken(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.Require = true
+	})})
+
+	// Request to matching host but with a different credential — should be rejected.
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer sk-some-other-key")
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
+}
+
+func TestSecrets_RequireContinuesWithProxyToken(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.Require = true
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_RequireDefaultFalseAllowsThrough(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry()})
+
+	// Request without proxy token — should still pass (require is false).
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer sk-some-other-key")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-some-other-key", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_RequireNonMatchingHostAllowsThrough(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.Require = true
+	})})
+
+	// Request to a different host — host doesn't match, so require doesn't apply.
+	req := httptest.NewRequest("GET", "http://other.com/v1/chat", nil)
+	req.Host = "other.com"
+	req.Header.Set("Authorization", "Bearer sk-some-other-key")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-some-other-key", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_RequireRejectsNoHeaders(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.Require = true
+	})})
+
+	// Request to matching host with no Authorization header at all.
+	req := openaiReq("GET", "/v1/chat")
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
+}
+
+func TestSecrets_RequireWithBodySwap(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = nil
+		e.MatchBody = true
+		e.Require = true
+	})})
+
+	body := `{"api_key": "proxy-openai-abc123"}`
+	rb := transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+
+	req := openaiReq("POST", "/v1/chat")
+	req.Body = rb
+
+	doTransform(t, s, req)
+
+	result, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(result), "sk-real-openai-key")
+}
+
 func TestSecrets_Name(t *testing.T) {
 	s := makeSecrets(t, nil)
 	require.Equal(t, "secrets", s.Name())
+}
+
+// --- Rules matching tests ---
+
+func TestSecrets_MethodFiltering(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.Rules = []hostmatch.RuleConfig{{Host: "api.openai.com", Methods: []string{"POST"}}}
+	})})
+
+	// GET request should NOT match the rule
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer proxy-openai-abc123", req.Header.Get("Authorization"))
+
+	// POST request should match
+	req = openaiReq("POST", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_PathFiltering(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.Rules = []hostmatch.RuleConfig{{Host: "api.openai.com", Paths: []string{"/v1/*"}}}
+	})})
+
+	// Path outside /v1/* should NOT match
+	req := openaiReq("GET", "/v2/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer proxy-openai-abc123", req.Header.Get("Authorization"))
+
+	// Path inside /v1/* should match
+	req = openaiReq("GET", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_MixedSourceTypes(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{
+		defaultEntry(),
+		defaultEntry(func(e *secretEntry) {
+			e.Source = awsSMSource("arn:aws:sm:test")
+			e.ProxyValue = "proxy-aws-tok"
+			e.MatchHeaders = []string{"X-Api-Key"}
+		}),
+	})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+	req.Header.Set("X-Api-Key", "proxy-aws-tok")
+
+	doTransform(t, s, req)
+
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+	require.Equal(t, "aws-secret-value", req.Header.Get("X-Api-Key"))
+}
+
+// --- End-to-end tests with real awsSMResolver and mock AWS client ---
+
+func awsSMRegistry(client smClient) resolverRegistry {
+	r := &awsSMResolver{
+		clients: make(map[string]smClient),
+		logger:  slog.Default(),
+	}
+	r.clientFor = func(_ context.Context, _ string) (smClient, error) {
+		return client, nil
+	}
+	return resolverRegistry{"aws_sm": r}
+}
+
+func makeAWSSMSecrets(t *testing.T, client smClient, entries []secretEntry) *Secrets {
+	t.Helper()
+	cfg := secretsConfig{Secrets: entries}
+	s, err := newFromConfig(context.Background(), cfg, awsSMRegistry(client))
+	require.NoError(t, err)
+	return s
+}
+
+func TestAWSSM_EndToEnd_HeaderSwap(t *testing.T) {
+	client := &mockSMClient{fn: func(_ context.Context, input *secretsmanager.GetSecretValueInput) (*secretsmanager.GetSecretValueOutput, error) {
+		require.Equal(t, "arn:aws:sm:us-east-1:123:secret:openai", aws.ToString(input.SecretId))
+		return &secretsmanager.GetSecretValueOutput{
+			SecretString: aws.String("sk-real-openai-key"),
+		}, nil
+	}}
+
+	s := makeAWSSMSecrets(t, client, []secretEntry{{
+		Source:       yamlNode(t, map[string]string{"type": "aws_sm", "secret_id": "arn:aws:sm:us-east-1:123:secret:openai"}),
+		ProxyValue:   "proxy-openai-abc123",
+		MatchHeaders: []string{"Authorization"},
+		Rules:        []hostmatch.RuleConfig{{Host: "api.openai.com"}},
+	}})
+
+	req := openaiReq("POST", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+}
+
+func TestAWSSM_EndToEnd_JSONKey(t *testing.T) {
+	client := staticSMClient(&secretsmanager.GetSecretValueOutput{
+		SecretString: aws.String(`{"api_key": "sk-from-json", "other": "ignored"}`),
+	}, nil)
+
+	s := makeAWSSMSecrets(t, client, []secretEntry{{
+		Source: yamlNode(t, map[string]string{
+			"type":      "aws_sm",
+			"secret_id": "arn:aws:sm:us-east-1:123:secret:multi",
+			"json_key":  "api_key",
+		}),
+		ProxyValue:   "proxy-tok",
+		MatchHeaders: []string{"X-Api-Key"},
+		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
+	}})
+
+	req := httptest.NewRequest("GET", "http://api.example.com/v1/data", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("X-Api-Key", "proxy-tok")
+
+	doTransform(t, s, req)
+	require.Equal(t, "sk-from-json", req.Header.Get("X-Api-Key"))
+}
+
+func TestAWSSM_EndToEnd_BodySwap(t *testing.T) {
+	client := staticSMClient(&secretsmanager.GetSecretValueOutput{
+		SecretString: aws.String("real-secret"),
+	}, nil)
+
+	s := makeAWSSMSecrets(t, client, []secretEntry{{
+		Source:    yamlNode(t, map[string]string{"type": "aws_sm", "secret_id": "arn:test"}),
+		ProxyValue: "proxy-tok",
+		MatchBody: true,
+		Rules:     []hostmatch.RuleConfig{{Host: "api.example.com"}},
+	}})
+
+	body := `{"key": "proxy-tok"}`
+	rb := transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+	req := httptest.NewRequest("POST", "http://api.example.com/v1/data", nil)
+	req.Host = "api.example.com"
+	req.Body = rb
+
+	doTransform(t, s, req)
+
+	result, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(result), "real-secret")
+	require.NotContains(t, string(result), "proxy-tok")
+}
+
+func TestAWSSM_EndToEnd_TTLRefresh(t *testing.T) {
+	var callCount atomic.Int32
+	client := &mockSMClient{fn: func(_ context.Context, _ *secretsmanager.GetSecretValueInput) (*secretsmanager.GetSecretValueOutput, error) {
+		n := callCount.Add(1)
+		// Return a different value each call so we can observe the refresh.
+		return &secretsmanager.GetSecretValueOutput{
+			SecretString: aws.String(fmt.Sprintf("value-%d", n)),
+		}, nil
+	}}
+
+	s := makeAWSSMSecrets(t, client, []secretEntry{{
+		Source: yamlNode(t, map[string]string{
+			"type":      "aws_sm",
+			"secret_id": "arn:test",
+			"ttl":       "1ns", // expires immediately so each request triggers refresh
+		}),
+		ProxyValue:   "proxy-tok",
+		MatchHeaders: []string{"Authorization"},
+		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
+	}})
+	// Initial resolve is call 1 (value-1).
+
+	// First request: TTL=1ns is already expired, so this triggers a refresh (call 2).
+	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("Authorization", "Bearer proxy-tok")
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer value-2", req.Header.Get("Authorization"))
+
+	// Second request: triggers another refresh (call 3).
+	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("Authorization", "Bearer proxy-tok")
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer value-3", req.Header.Get("Authorization"))
+
+	require.GreaterOrEqual(t, callCount.Load(), int32(3))
+}
+
+func TestAWSSM_EndToEnd_TTLServesStaleOnError(t *testing.T) {
+	var callCount atomic.Int32
+	client := &mockSMClient{fn: func(_ context.Context, _ *secretsmanager.GetSecretValueInput) (*secretsmanager.GetSecretValueOutput, error) {
+		n := callCount.Add(1)
+		// First call (initial resolve at startup) succeeds.
+		if n == 1 {
+			return &secretsmanager.GetSecretValueOutput{
+				SecretString: aws.String("good-value"),
+			}, nil
+		}
+		// All subsequent refresh attempts fail.
+		return nil, fmt.Errorf("aws transient error")
+	}}
+
+	s := makeAWSSMSecrets(t, client, []secretEntry{{
+		Source: yamlNode(t, map[string]string{
+			"type":      "aws_sm",
+			"secret_id": "arn:test",
+			"ttl":       "1ns",
+		}),
+		ProxyValue:   "proxy-tok",
+		MatchHeaders: []string{"Authorization"},
+		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
+	}})
+	require.Equal(t, int32(1), callCount.Load()) // initial resolve
+
+	// First request: TTL expired, refresh fails, stale "good-value" served.
+	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("Authorization", "Bearer proxy-tok")
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer good-value", req.Header.Get("Authorization"))
+
+	// Second request: same — refresh fails again, stale value still served.
+	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("Authorization", "Bearer proxy-tok")
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer good-value", req.Header.Get("Authorization"))
+
+	// At least 2 refresh attempts beyond the initial resolve.
+	require.GreaterOrEqual(t, callCount.Load(), int32(3))
+}
+
+func TestAWSSM_EndToEnd_RequireRejectsWithoutToken(t *testing.T) {
+	client := staticSMClient(&secretsmanager.GetSecretValueOutput{
+		SecretString: aws.String("real-secret"),
+	}, nil)
+
+	s := makeAWSSMSecrets(t, client, []secretEntry{{
+		Source:       yamlNode(t, map[string]string{"type": "aws_sm", "secret_id": "arn:test"}),
+		ProxyValue:   "proxy-tok",
+		MatchHeaders: []string{"Authorization"},
+		Require:      true,
+		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
+	}})
+
+	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("Authorization", "Bearer wrong-token")
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
 }

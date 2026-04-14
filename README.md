@@ -1,5 +1,7 @@
 # iron-proxy
 
+[![Docs](https://img.shields.io/badge/docs-iron--proxy-blue)](https://docs.iron.sh)
+[![Latest Release](https://img.shields.io/github/v/release/ironsh/iron-proxy)](https://github.com/ironsh/iron-proxy/releases/latest)
 [![Docker Pulls](https://img.shields.io/docker/pulls/ironsh/iron-proxy)](https://hub.docker.com/r/ironsh/iron-proxy)
 
 ## The problem
@@ -33,6 +35,8 @@ Single binary. Single YAML config.
 - **Streaming-aware.** WebSocket upgrades and Server-Sent Events are proxied
   natively. No special configuration for agent workloads that hold long-lived
   connections.
+- **CONNECT and SOCKS5 support.** Optional tunnel listener for tools that
+  natively support proxy configuration via `HTTPS_PROXY` or SOCKS5 settings.
 
 Built for CI pipelines, GitHub Actions, AI agents (Claude Code, Cursor,
 Codex), and any environment where you run code you don't fully trust.
@@ -56,23 +60,23 @@ Or build from source:
 ```bash
 go build -o iron-proxy ./cmd/iron-proxy
 ```
- 
+
 ## Quick start
- 
+
 ```bash
 cd examples/docker-compose
 docker compose up
 ```
- 
+
 This starts iron-proxy and a demo client that fires five requests through the
 proxy. Check the logs to see allowed, blocked, and secret-rewritten requests:
- 
+
 ```bash
 docker compose logs proxy
 ```
- 
+
 Every request produces a structured JSON audit entry:
- 
+
 ```json
 {
   "host": "httpbin.org",
@@ -91,7 +95,7 @@ Every request produces a structured JSON audit entry:
   ]
 }
 ```
- 
+
 Rejected requests include a `rejected_by` field and log at WARN level. See
 [Audit log format](#audit-log-format) for the full schema.
 
@@ -222,6 +226,9 @@ dns:
 proxy:
   http_listen: ":80"
   https_listen: ":443"
+  tunnel_listen: ":8080" # Optional CONNECT/SOCKS5 listener
+  max_request_body_bytes: 1048576 # 1 MiB (default)
+  max_response_body_bytes: 0 # uncapped (default)
 
 tls:
   ca_cert: "/etc/iron-proxy/ca.crt" # Required
@@ -240,14 +247,16 @@ transforms:
 
   - name: secrets
     config:
-      source: env
       secrets:
-        - var: OPENAI_API_KEY # Env var holding the real secret
+        - source:
+            type: env
+            var: OPENAI_API_KEY # Env var holding the real secret
           proxy_value: "proxy-token-123" # Token the sandbox sends
           match_headers: ["Authorization"]
           match_body: false
-          hosts:
-            - name: "api.openai.com"
+          require: true # Reject requests without the proxy token
+          rules:
+            - host: "api.openai.com"
 
 log:
   level: "info" # debug, info, warn, error
@@ -270,6 +279,42 @@ Unmatched requests get a `403 Forbidden`.
 Domain patterns use glob matching: `*.example.com` matches any subdomain and
 `example.com` itself.
 
+**Warn mode:** Set `warn: true` to observe what the allowlist would block without
+actually enforcing it. Requests that would be rejected are allowed through but
+annotated with `"action": "warn"` in the transform trace. This is useful for
+rolling out new allowlist rules or auditing existing traffic before switching
+to enforcement.
+
+### Annotate
+
+Captures HTTP request headers into audit log annotations based on
+host/method/path rules. This is useful for enriching audit logs with
+request-specific context like request IDs without modifying the proxy core.
+
+Each annotation group specifies rules to match and headers to capture. When a
+request matches any rule in a group, the specified header values are written as
+`header:<Name>` entries in the transform trace annotations. Requests that don't
+match are passed through unchanged. This transform never rejects requests.
+
+> **Warning:** Header values are emitted in plain text in the audit log. Only
+> log headers that are safe to expose, such as request IDs or headers containing
+> proxy secret tokens. Do not log headers that contain raw secrets.
+
+```yaml
+transforms:
+  - name: annotate
+    config:
+      annotations:
+        - rules:
+            - host: "api.openai.com"
+              methods: ["POST"]
+              paths: ["/v1/*"]
+          headers: ["x-request-id"]
+        - rules:
+            - host: "*.anthropic.com"
+          headers: ["x-request-id"]
+```
+
 ### Secrets
 
 The sandbox never holds real credentials. Instead:
@@ -282,10 +327,87 @@ iron-proxy scans outbound requests and replaces proxy tokens with the real
 values before forwarding upstream. You control where it looks:
 
 - **`match_headers`:** list of header names to scan. Empty list = all headers.
-- **`match_body`:** scan the request body (buffered, up to 1 MB).
+- **`match_body`:** scan the request body (buffered up to `max_request_body_bytes`).
+- **`require`:** when `true`, requests to a matching host that do **not** contain
+  the proxy token are rejected with 403. This prevents a compromised workload
+  from bypassing the secret-swap mechanism with alternative credentials. Default: `false`.
 - **`hosts`:** restrict swapping to specific domains or CIDRs.
 
 Query parameters are always scanned.
+
+### Body limits
+
+Transforms that inspect or forward request/response bodies (secrets body
+matching, gRPC transforms) operate on buffered bodies. Two global settings
+control the maximum buffer sizes:
+
+- **`max_request_body_bytes`** (default: `1048576` / 1 MiB): caps how much of
+  the request body is buffered for transforms. Data beyond this limit is
+  truncated from the transform's perspective but still forwarded to upstream.
+- **`max_response_body_bytes`** (default: `0` / uncapped): caps how much of
+  the response body is buffered. Set to `0` to buffer the full response, which
+  is the right default for most workloads (e.g., npm packages, model weights).
+
+Bodies are buffered incrementally as transforms read them, and automatically
+rewound between pipeline stages. If a transform doesn't read the body, no
+buffering occurs and the body streams through untouched.
+
+### Tunnel listener (CONNECT/SOCKS5)
+
+The tunnel listener accepts HTTP CONNECT and SOCKS5 connections on a
+dedicated port. This is useful for tools that natively support proxy
+configuration via `HTTPS_PROXY`/`ALL_PROXY` environment variables or
+SOCKS5 settings, rather than relying on DNS-based routing.
+
+To enable it, set `tunnel_listen` under `proxy`:
+
+```yaml
+proxy:
+  tunnel_listen: ":8080"
+```
+
+When omitted, the tunnel listener is disabled.
+
+Both protocols go through the same transform pipeline as regular HTTP/HTTPS
+requests. The proxy evaluates a synthetic CONNECT request against your
+allowlist and secrets transforms, so tunnel connections are subject to the
+same default-deny policy.
+
+After the CONNECT or SOCKS5 handshake, the proxy peeks at the first byte to
+detect the inner protocol:
+
+- **TLS (0x16):** performs MITM the same way as the HTTPS listener,
+  generating a leaf cert on the fly so transforms can inspect and rewrite
+  the request.
+- **Plain HTTP:** serves the request directly through the transform
+  pipeline.
+
+**HTTP CONNECT example:**
+
+```bash
+curl -x http://172.20.0.2:8080 \
+  --cacert /certs/ca.crt \
+  https://httpbin.org/get
+```
+
+**SOCKS5 example:**
+
+```bash
+curl --socks5-hostname 172.20.0.2:8080 \
+  --cacert /certs/ca.crt \
+  https://httpbin.org/get
+```
+
+You can also set the standard environment variables so all tools route
+through the tunnel automatically:
+
+```bash
+export HTTPS_PROXY=http://172.20.0.2:8080
+export ALL_PROXY=socks5h://172.20.0.2:8080
+```
+
+The SOCKS5 implementation supports no-auth only and accepts IPv4, IPv6,
+and domain name address types.
 
 ### TLS
 
@@ -475,19 +597,22 @@ transforms:
 
   - name: secrets
     config:
-      source: env
       secrets:
-        - var: OPENAI_API_KEY
+        - source:
+            type: env
+            var: OPENAI_API_KEY
           proxy_value: "proxy-openai-abc123"
           match_headers: ["Authorization"]
-          hosts:
-            - name: "httpbin.org"
+          rules:
+            - host: "httpbin.org"
 
-        - var: INTERNAL_TOKEN
+        - source:
+            type: env
+            var: INTERNAL_TOKEN
           proxy_value: "proxy-internal-tok"
           match_headers: [] # scan all headers
-          hosts:
-            - name: "httpbin.org"
+          rules:
+            - host: "httpbin.org"
 ```
 
 The client script sends five requests to demonstrate each behavior:
@@ -540,8 +665,71 @@ Every proxied request produces a structured JSON log entry:
 
 Rejected requests include a `rejected_by` field and log at WARN level.
 
+## OpenTelemetry export
+
+Audit events can be exported as OpenTelemetry structured log records for
+offline analysis in backends like Axiom, ClickHouse, or Logfire. Set
+`OTEL_EXPORTER_OTLP_ENDPOINT` to enable:
+
+```bash
+docker run -d --name iron-proxy \
+  -e OTEL_EXPORTER_OTLP_ENDPOINT=https://logfire-us.pydantic.dev \
+  -e OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
+  -e OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer <token>" \
+  -e OTEL_SERVICE_NAME=iron-proxy \
+  -e OTEL_RESOURCE_ATTRIBUTES="deployment.environment=staging" \
+  # ... other flags ...
+  ironsh/iron-proxy:latest -config /etc/iron-proxy/proxy.yaml
+```
+
+All configuration uses standard OTEL environment variables:
+
+| Variable                       | Description                                             | Default          |
+| ------------------------------ | ------------------------------------------------------- | ---------------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector URL. OTEL export is disabled when unset. | (disabled)       |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` or `grpc`.                              | `http/protobuf`  |
+| `OTEL_EXPORTER_OTLP_HEADERS`  | Comma-separated `key=value` pairs for auth headers.     | (none)           |
+| `OTEL_SERVICE_NAME`            | Service name attached to all log records.                | `iron-proxy`     |
+| `OTEL_RESOURCE_ATTRIBUTES`    | Comma-separated `key=value` resource attributes.        | (none)           |
+
+When enabled, every audit event is emitted as an OTEL log record alongside the
+existing JSON stderr logs. The log record carries the same schema as the JSON
+audit entry: `host`, `method`, `path`, `action`, `status_code`, `duration_ms`,
+and the full `request_transforms`/`response_transforms` arrays with annotations.
+
 ## iron.sh
 
 Need Vault/KMS secret backends, a Kubernetes operator, or centralized policy
 management? [iron.sh](https://iron.sh) builds on iron-proxy with enterprise
 features for teams running this at scale.
+
+## Verify release signatures
+
+Release artifacts include a signed checksum manifest:
+
+- `checksums.txt`
+- `checksums.txt.asc` (ASCII-armored detached signature)
+
+Use the included public key at [`public-key.asc`](public-key.asc) to verify:
+
+```bash
+# 1) Download release artifacts for a tag
+TAG=vX.Y.Z
+gh release download "$TAG" --pattern "checksums.txt" --pattern "checksums.txt.asc"
+
+# 2) Import the project signing key
+gpg --import public-key.asc
+
+# 3) Verify the signature over checksums.txt
+gpg --verify checksums.txt.asc checksums.txt
+```
+
+If verification succeeds, GPG will report a good signature from `Matthew Slipper <matt@iron.sh>`.
+
+You can optionally inspect the imported key fingerprint and confirm it matches your trusted source before verification.
+
+To verify a specific binary against the signed checksum list (example: `iron-proxy-linux-amd64`):
+
+```bash
+shasum -a 256 iron-proxy-linux-amd64 | grep -F "$(grep -F 'iron-proxy-linux-amd64' checksums.txt | awk '{print $1}')"
+```

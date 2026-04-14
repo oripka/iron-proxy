@@ -3,6 +3,7 @@ package transform
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -12,17 +13,25 @@ import (
 // AuditFunc is called after every request completes with the full pipeline result.
 type AuditFunc func(result *PipelineResult)
 
+// BodyLimits holds the global max body sizes for request and response buffering.
+type BodyLimits struct {
+	MaxRequestBodyBytes  int64
+	MaxResponseBodyBytes int64
+}
+
 // Pipeline executes a sequence of transforms on requests and responses.
 type Pipeline struct {
 	transforms []Transformer
+	bodyLimits BodyLimits
 	onComplete AuditFunc
 	logger     *slog.Logger
 }
 
 // NewPipeline creates a Pipeline from the given transforms.
-func NewPipeline(transforms []Transformer, logger *slog.Logger) *Pipeline {
+func NewPipeline(transforms []Transformer, bodyLimits BodyLimits, logger *slog.Logger) *Pipeline {
 	return &Pipeline{
 		transforms: transforms,
+		bodyLimits: bodyLimits,
 		logger:     logger,
 	}
 }
@@ -41,6 +50,9 @@ func (p *Pipeline) ProcessRequest(ctx context.Context, tctx *TransformContext, r
 		start := time.Now()
 		result, err := t.TransformRequest(ctx, tctx, req)
 		dur := time.Since(start)
+
+		// Reset body for the next transform.
+		RequireBufferedBody(req.Body).Reset()
 
 		trace := TransformTrace{
 			Name:        t.Name(),
@@ -75,6 +87,10 @@ func (p *Pipeline) ProcessResponse(ctx context.Context, tctx *TransformContext, 
 		start := time.Now()
 		result, err := t.TransformResponse(ctx, tctx, req, resp)
 		dur := time.Since(start)
+
+		// Reset bodies for the next transform.
+		RequireBufferedBody(req.Body).Reset()
+		RequireBufferedBody(resp.Body).Reset()
 
 		trace := TransformTrace{
 			Name:        t.Name(),
@@ -122,9 +138,34 @@ func forbiddenResponse(req *http.Request) *http.Response {
 	}
 }
 
+// AuditFunc returns the registered audit callback, or nil.
+func (p *Pipeline) AuditFunc() AuditFunc {
+	return p.onComplete
+}
+
+// BodyLimits returns the global body size limits.
+func (p *Pipeline) BodyLimits() BodyLimits {
+	return p.bodyLimits
+}
+
 // Empty returns true if the pipeline has no transforms.
 func (p *Pipeline) Empty() bool {
 	return len(p.transforms) == 0
+}
+
+// Close closes any transforms that implement io.Closer (e.g. to stop background
+// goroutines or release connections). Should be called when a pipeline is being
+// replaced.
+func (p *Pipeline) Close() error {
+	var firstErr error
+	for _, t := range p.transforms {
+		if c, ok := t.(io.Closer); ok {
+			if err := c.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	return firstErr
 }
 
 // Names returns the names of all transforms in the pipeline, for logging.
