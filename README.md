@@ -203,6 +203,7 @@ Transforms run in order. Built-in transforms:
 | Transform   | What it does                                                                                                            |
 | ----------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `allowlist` | Permits requests to matching domains/CIDRs; rejects everything else (403).                                              |
+| `interactive_policy` | Permits configured host/method/path rules and delegates misses to an external local policy service.             |
 | `secrets`   | Scans headers, query params, and optionally body for proxy tokens and swaps in real secrets from environment variables. |
 
 ## Configuration
@@ -314,6 +315,29 @@ transforms:
             - host: "*.anthropic.com"
           headers: ["x-request-id"]
 ```
+
+### Interactive policy
+
+`interactive_policy` is intended for local wrappers such as Guard. It allows
+configured rules immediately, and when a request misses those rules it POSTs
+safe request metadata to an external policy service. The service returns
+`{"action":"allow"}` or `{"action":"deny"}`.
+
+```yaml
+transforms:
+  - name: interactive_policy
+    config:
+      endpoint: "http://127.0.0.1:17891/decision"
+      timeout_ms: 300000
+      rules:
+        - host: "api.openai.com"
+          methods: ["POST"]
+          paths: ["/v1/responses", "/v1/oripka/*"]
+```
+
+The request payload includes `host`, `method`, `path`, a query-redacted `url`,
+SNI, and safe headers. Sensitive headers such as `Authorization`, `Cookie`, and
+`Proxy-Authorization` are not sent to the policy service.
 
 ### Secrets
 
