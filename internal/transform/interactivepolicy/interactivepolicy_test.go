@@ -46,6 +46,30 @@ rules:
 	require.Equal(t, 0, calls)
 }
 
+func TestConfiguredRuleAllowsConnectPreflightWithoutDelegating(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	policy := newPolicyForTest(t, `
+endpoint: "`+server.URL+`"
+rules:
+  - host: "api.openai.com"
+    methods: ["POST"]
+    paths: ["/v1/*"]
+`)
+	req := httptest.NewRequest(http.MethodConnect, "https://api.openai.com:443", nil)
+	req.Host = "api.openai.com:443"
+
+	result, err := policy.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionContinue, result.Action)
+	require.Equal(t, 0, calls)
+}
+
 func TestDelegatesMissToPolicyService(t *testing.T) {
 	var seen decisionRequest
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -83,6 +83,10 @@ func factory(cfg yaml.Node, _ *slog.Logger) (transform.Transformer, error) {
 func (p *InteractivePolicy) Name() string { return "interactive_policy" }
 
 func (p *InteractivePolicy) TransformRequest(ctx context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
+	if req.Method == http.MethodConnect && len(p.rules) > 0 && hostmatch.MatchAnyRuleHost(ctx, p.rules, req) {
+		tctx.Annotate("decision", "connect-host-allow")
+		return &transform.TransformResult{Action: transform.ActionContinue}, nil
+	}
 	if len(p.rules) > 0 && hostmatch.MatchAnyRule(ctx, p.rules, req) {
 		tctx.Annotate("decision", "configured-allow")
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil

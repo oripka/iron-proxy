@@ -36,6 +36,13 @@ func (r *Rule) Matches(ctx context.Context, host, method, path string) bool {
 	return true
 }
 
+// MatchesHost returns true when the rule's host or CIDR matcher accepts host,
+// ignoring any method/path restrictions. This is used for CONNECT preflight
+// checks before a tunneled TLS request can be inspected.
+func (r *Rule) MatchesHost(ctx context.Context, host string) bool {
+	return r.Matcher.Matches(ctx, host)
+}
+
 // CompileRules compiles a list of RuleConfigs into Rules.
 // The prefix is used for error messages (e.g. "allowlist" or "grpc transform \"foo\"").
 func CompileRules(configs []RuleConfig, resolver Resolver, prefix string) ([]Rule, error) {
@@ -92,6 +99,16 @@ func MatchAnyRule(ctx context.Context, rules []Rule, req *http.Request) bool {
 	host := StripPort(req.Host)
 	for _, r := range rules {
 		if r.Matches(ctx, host, req.Method, req.URL.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+func MatchAnyRuleHost(ctx context.Context, rules []Rule, req *http.Request) bool {
+	host := StripPort(req.Host)
+	for _, r := range rules {
+		if r.MatchesHost(ctx, host) {
 			return true
 		}
 	}

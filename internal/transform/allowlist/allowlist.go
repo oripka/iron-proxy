@@ -25,8 +25,8 @@ type Allowlist struct {
 }
 
 type allowlistConfig struct {
-	Domains []string              `yaml:"domains"`
-	CIDRs   []string              `yaml:"cidrs"`
+	Domains []string               `yaml:"domains"`
+	CIDRs   []string               `yaml:"cidrs"`
 	Rules   []hostmatch.RuleConfig `yaml:"rules"`
 	Warn    bool                   `yaml:"warn"`
 }
@@ -79,6 +79,10 @@ func New(domains []string, cidrs []string, resolver hostmatch.Resolver) (*Allowl
 func (a *Allowlist) Name() string { return "allowlist" }
 
 func (a *Allowlist) TransformRequest(ctx context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
+	if req.Method == http.MethodConnect && hostmatch.MatchAnyRuleHost(ctx, a.rules, req) {
+		tctx.Annotate("decision", "connect-host-allow")
+		return &transform.TransformResult{Action: transform.ActionContinue}, nil
+	}
 	if hostmatch.MatchAnyRule(ctx, a.rules, req) {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}

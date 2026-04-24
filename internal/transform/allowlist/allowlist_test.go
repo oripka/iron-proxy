@@ -279,6 +279,20 @@ func TestAllowlist_HostMethodPathCombined(t *testing.T) {
 	require.Equal(t, transform.ActionReject, resultWithMethodAndPath(t, a, "evil.com", "POST", "/v1/chat").Action)
 }
 
+func TestAllowlist_CONNECTAllowsKnownHostForMitmPreflight(t *testing.T) {
+	a, err := newFromConfig(allowlistConfig{
+		Rules: []hostmatch.RuleConfig{{
+			Host:    "api.openai.com",
+			Methods: []string{"POST"},
+			Paths:   []string{"/v1/*"},
+		}},
+	}, &mockResolver{})
+	require.NoError(t, err)
+
+	require.Equal(t, transform.ActionContinue, resultWithMethodAndPath(t, a, "api.openai.com:443", http.MethodConnect, "").Action)
+	require.Equal(t, transform.ActionReject, resultWithMethodAndPath(t, a, "evil.com:443", http.MethodConnect, "").Action)
+}
+
 func TestAllowlist_MultiRuleSecondMatches(t *testing.T) {
 	a, err := newFromConfig(allowlistConfig{
 		Rules: []hostmatch.RuleConfig{
