@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -30,6 +29,7 @@ import (
 	_ "github.com/ironsh/iron-proxy/internal/transform/annotate"
 	_ "github.com/ironsh/iron-proxy/internal/transform/grpc"
 	_ "github.com/ironsh/iron-proxy/internal/transform/interactivepolicy"
+	_ "github.com/ironsh/iron-proxy/internal/transform/judge"
 	_ "github.com/ironsh/iron-proxy/internal/transform/secrets"
 )
 
@@ -42,33 +42,24 @@ func main() {
 		case "generate-ca":
 			runGenerateCA(os.Args[2:])
 			return
+		case "init":
+			runInit(os.Args[2:])
+			return
+		case "version", "--version", "-v":
+			fmt.Println(version)
+			return
 		}
 	}
 
 	configPath := flag.String("config", "", "path to iron-proxy YAML config file")
+	bootstrapTokenFlag := flag.String("bootstrap-token", "", "bootstrap token for control plane registration")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Mode is determined exclusively by how config is provided:
-	//   -config flag  → standalone (YAML file)
-	//   no flag       → managed (env vars + control plane)
-	managed := *configPath == ""
-
-	var cfg *config.Config
-	var err error
-	if managed {
-		cfg, err = config.FromEnv()
-	} else {
-		cfg, err = config.LoadFile(*configPath)
-	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-
-	stateStore, err := resolveStateStore()
+	// Load config: parse file (if provided) → env overrides → defaults.
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -79,6 +70,26 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+
+	// CLI flag takes precedence over environment variable.
+	bootstrapToken := *bootstrapTokenFlag
+	if bootstrapToken == "" {
+		bootstrapToken = os.Getenv("IRON_BOOTSTRAP_TOKEN")
+	}
+
+	// Managed mode is determined by the presence of a bootstrap token or
+	// an existing credential from a prior registration.
+	stateStore, err := stateStorePath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	cred, credErr := controlplane.LoadCredential(stateStore)
+	if credErr != nil && !errors.Is(credErr, os.ErrNotExist) {
+		logger.Error("loading credential", slog.String("error", credErr.Error()))
+		os.Exit(1)
+	}
+	managed := bootstrapToken != "" || cred != nil
 
 	// Both modes produce a pipeline holder. Managed mode populates the
 	// initial transforms from the control plane and starts a poller that
@@ -92,18 +103,32 @@ func main() {
 	// and (in managed mode) the config poller.
 	errc := make(chan error, 4)
 	var holder *transform.PipelineHolder
+	var otelCfg iotel.ExportConfig
 
 	if managed {
-		holder = initManaged(ctx, cfg, bodyLimits, errc, stateStore, logger)
+		var ingestToken string
+		holder, ingestToken = initManaged(ctx, cfg, bodyLimits, errc, stateStore, bootstrapToken, cred, logger)
+		if ingestToken != "" {
+			otelCfg.DefaultEndpoint = "https://ingest.iron.sh/v1/logs"
+			otelCfg.DefaultHeaders = map[string]string{
+				"Authorization": "Bearer " + ingestToken,
+			}
+		}
 	} else {
 		holder = initStandalone(cfg, bodyLimits, logger)
+	}
+
+	// 5. Validate the fully-assembled config.
+	if err := config.Validate(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Set up audit function.
 	auditFunc := transform.AuditFunc(transform.NewAuditLogger(logger))
 	var otelShutdown func(context.Context) error
-	if iotel.Enabled() {
-		otelProvider, otelErr := iotel.NewLoggerProvider(ctx)
+	if otelCfg.Enabled() {
+		otelProvider, otelErr := iotel.NewLoggerProvider(ctx, otelCfg)
 		if otelErr != nil {
 			logger.Error("initializing OTEL log provider", slog.String("error", otelErr.Error()))
 			os.Exit(1)
@@ -114,12 +139,18 @@ func main() {
 	}
 	holder.Load().SetAuditFunc(auditFunc)
 
-	// Initialize cert cache.
-	leafExpiry := time.Duration(cfg.TLS.LeafCertExpiryHours) * time.Hour
-	certCache, err := certcache.New(cfg.TLS.CACert, cfg.TLS.CAKey, cfg.TLS.CertCacheSize, leafExpiry)
-	if err != nil {
-		logger.Error("initializing cert cache", slog.String("error", err.Error()))
-		os.Exit(1)
+	// Initialize cert cache. Not needed in sni-only mode since TLS is never
+	// terminated and no leaf certs are generated.
+	var certCache *certcache.Cache
+	if cfg.TLS.Mode != config.TLSModeSNIOnly {
+		leafExpiry := time.Duration(cfg.TLS.LeafCertExpiryHours) * time.Hour
+		certCache, err = certcache.New(cfg.TLS.CACert, cfg.TLS.CAKey, cfg.TLS.CertCacheSize, leafExpiry)
+		if err != nil {
+			logger.Error("initializing cert cache", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	} else if cfg.TLS.CACert != "" || cfg.TLS.CAKey != "" {
+		logger.Warn("tls.ca_cert and tls.ca_key are ignored when tls.mode=sni-only")
 	}
 
 	// Build upstream resolver.
@@ -145,7 +176,16 @@ func main() {
 	}
 
 	// Initialize proxy.
-	p := proxy.New(cfg.Proxy.HTTPListen, cfg.Proxy.HTTPSListen, cfg.Proxy.TunnelListen, certCache, holder, resolver, logger)
+	p := proxy.New(proxy.Options{
+		HTTPAddr:   cfg.Proxy.HTTPListen,
+		HTTPSAddr:  cfg.Proxy.HTTPSListen,
+		TunnelAddr: cfg.Proxy.TunnelListen,
+		TLSMode:    cfg.TLS.Mode,
+		CertCache:  certCache,
+		Pipeline:   holder,
+		Resolver:   resolver,
+		Logger:     logger,
+	})
 
 	// Initialize metrics server.
 	metricsServer := metrics.New(cfg.Metrics.Listen, logger)
@@ -213,18 +253,11 @@ func main() {
 
 // initManaged registers with the control plane, performs an initial sync, builds
 // the initial pipeline, and starts the config poller. The poller runs until ctx
-// is canceled and sends fatal errors on errc.
-func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.BodyLimits, errc chan<- error, stateStore string, logger *slog.Logger) *transform.PipelineHolder {
-	bootstrapToken := os.Getenv("IRON_BOOTSTRAP_TOKEN")
-
-	cred, err := controlplane.LoadCredential(stateStore)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		logger.Error("loading credential", slog.String("error", err.Error()))
-		os.Exit(1)
-	}
-
+// is canceled and sends fatal errors on errc. Returns the pipeline holder and
+// the ingest token from the initial sync (empty if the sync failed).
+func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.BodyLimits, errc chan<- error, stateStore, bootstrapToken string, cred *controlplane.Credential, logger *slog.Logger) (*transform.PipelineHolder, string) {
 	cpURL := envOrDefault("IRON_CONTROL_PLANE_URL", "https://api.iron.sh")
-	tags := parseTags(os.Getenv("IRON_TAGS"))
+	tags := cfg.Tags
 	logger.Info("starting in managed mode", slog.String("control_plane_url", cpURL))
 
 	client := controlplane.NewClient(cpURL, logger)
@@ -243,6 +276,10 @@ func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.B
 		}
 		logger.Info("registered successfully", slog.String("proxy_id", cred.ProxyID))
 
+		if err := ensureStateStoreDir(stateStore); err != nil {
+			logger.Error("creating state store directory", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
 		if err := controlplane.SaveCredential(stateStore, cred); err != nil {
 			logger.Error("saving credential", slog.String("error", err.Error()))
 			os.Exit(1)
@@ -266,10 +303,12 @@ func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.B
 	}
 
 	configHash := ""
+	ingestToken := ""
 	var initialRules json.RawMessage
 	if syncResp != nil {
 		configHash = syncResp.ConfigHash
 		initialRules = syncResp.Rules
+		ingestToken = syncResp.IngestToken
 		if len(syncResp.Rules) > 0 {
 			logger.Info("received initial config from control plane",
 				slog.String("config_hash", syncResp.ConfigHash),
@@ -311,7 +350,7 @@ func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.B
 		errc <- poller.Run(ctx)
 	}()
 
-	return holder
+	return holder, ingestToken
 }
 
 // initStandalone builds the pipeline from the YAML config's transforms.
@@ -324,38 +363,25 @@ func initStandalone(cfg *config.Config, bodyLimits transform.BodyLimits, logger 
 	return transform.NewPipelineHolder(pipeline)
 }
 
-func parseTags(s string) []string {
-	if s == "" {
-		return nil
+// stateStorePath returns the state store path without creating any directories.
+// It honors IRON_STATE_STORE and falls back to the XDG config directory.
+func stateStorePath() (string, error) {
+	if v := os.Getenv("IRON_STATE_STORE"); v != "" {
+		return v, nil
 	}
-	parts := strings.Split(s, ",")
-	tags := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			tags = append(tags, p)
-		}
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("determining config directory: %w", err)
 	}
-	return tags
+	return filepath.Join(configDir, "iron-proxy", "state"), nil
 }
 
-// resolveStateStore returns the state store path, creating its parent directory
-// if needed. It honors IRON_STATE_STORE and falls back to the XDG config directory.
-func resolveStateStore() (string, error) {
-	stateStore := os.Getenv("IRON_STATE_STORE")
-	if stateStore == "" {
-		configDir, err := os.UserConfigDir()
-		if err != nil {
-			return "", fmt.Errorf("determining config directory: %w", err)
-		}
-		stateStore = filepath.Join(configDir, "iron-proxy", "state")
-	}
-
+// ensureStateStoreDir creates the parent directory for the state store path.
+func ensureStateStoreDir(stateStore string) error {
 	if err := os.MkdirAll(filepath.Dir(stateStore), 0o700); err != nil {
-		return "", fmt.Errorf("creating state store directory: %w", err)
+		return fmt.Errorf("creating state store directory: %w", err)
 	}
-
-	return stateStore, nil
+	return nil
 }
 
 // buildPipeline creates a transform.Pipeline from config transforms.

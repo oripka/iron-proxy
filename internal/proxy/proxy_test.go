@@ -70,7 +70,14 @@ func startProxyWithPipeline(t *testing.T, pipeline *transform.Pipeline) (*Proxy,
 	require.NoError(t, err)
 
 	holder := transform.NewPipelineHolder(pipeline)
-	p := New("127.0.0.1:0", "127.0.0.1:0", "", cache, holder, nil, testLogger())
+	p := New(Options{
+		HTTPAddr:   "127.0.0.1:0",
+		HTTPSAddr:  "127.0.0.1:0",
+		TunnelAddr: "",
+		CertCache:  cache,
+		Pipeline:   holder,
+		Logger:     testLogger(),
+	})
 
 	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -135,7 +142,13 @@ func startProxyWithTransforms(t *testing.T, transforms []transform.Transformer) 
 
 	pipeline := transform.NewPipeline(transforms, transform.BodyLimits{}, testLogger())
 	holder := transform.NewPipelineHolder(pipeline)
-	p := New("127.0.0.1:0", "127.0.0.1:0", "", cache, holder, nil, testLogger())
+	p := New(Options{
+		HTTPAddr:  "127.0.0.1:0",
+		HTTPSAddr: "127.0.0.1:0",
+		CertCache: cache,
+		Pipeline:  holder,
+		Logger:    testLogger(),
+	})
 
 	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

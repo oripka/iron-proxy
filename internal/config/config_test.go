@@ -17,6 +17,25 @@ tls:
 `
 }
 
+func TestParse_NoDefaultsOrValidation(t *testing.T) {
+	// parse should not apply defaults or validate.
+	yaml := `
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+	cfg, err := parse(strings.NewReader(yaml))
+	require.NoError(t, err)
+
+	// dns.proxy_ip is missing but parse should not error.
+	require.Equal(t, "", cfg.DNS.ProxyIP)
+
+	// Defaults should not be applied.
+	require.Equal(t, "", cfg.DNS.Listen)
+	require.Equal(t, "", cfg.Proxy.HTTPListen)
+	require.Equal(t, "", cfg.Log.Level)
+}
+
 func TestLoad_ValidConfig(t *testing.T) {
 	cfg, err := Load(strings.NewReader(validYAML()))
 	require.NoError(t, err)
@@ -251,6 +270,45 @@ transforms:
 	require.NoError(t, cfg.Transforms[0].Config.Decode(&allowCfg))
 	require.Equal(t, []string{"*.example.com"}, allowCfg.Domains)
 	require.Equal(t, []string{"10.0.0.0/8"}, allowCfg.CIDRs)
+}
+
+func TestLoad_SNIOnlyMode(t *testing.T) {
+	t.Run("ca cert not required", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  mode: "sni-only"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.Equal(t, "sni-only", cfg.TLS.Mode)
+		require.Equal(t, "", cfg.TLS.CACert)
+	})
+
+	t.Run("unknown mode rejected", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  mode: "hybrid"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "tls.mode")
+	})
+
+	t.Run("mitm mode still requires ca_cert", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  mode: "mitm"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "tls.ca_cert")
+	})
 }
 
 func TestLoad_DNSPassthroughAndRecords(t *testing.T) {
