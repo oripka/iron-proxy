@@ -640,6 +640,7 @@ func buildTransport(resolver *net.Resolver) *http.Transport {
 		Resolver:  resolver,
 	}
 	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
