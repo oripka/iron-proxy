@@ -205,6 +205,7 @@ Transforms run in order. Built-in transforms:
 | `allowlist` | Permits requests to matching domains/CIDRs; rejects everything else (403).                                              |
 | `interactive_policy` | Permits configured host/method/path rules and delegates misses to an external local policy service.             |
 | `secrets`   | Scans headers, query params, and optionally body for proxy tokens and swaps in real secrets from environment variables. |
+| `aws_sigv4` | Re-signs matching AWS requests with SigV4 credentials held only by the proxy process.                                  |
 
 ## Configuration
 
@@ -258,6 +259,17 @@ transforms:
           require: true # Reject requests without the proxy token
           rules:
             - host: "api.openai.com"
+
+  - name: aws_sigv4
+    config:
+      signers:
+        - service: ses
+          region: eu-central-1
+          access_key_id_env: SES_AWS_ACCESS_KEY_ID
+          secret_access_key_env: SES_AWS_SECRET_ACCESS_KEY
+          session_token_env: SES_AWS_SESSION_TOKEN # optional
+          rules:
+            - host: "email.eu-central-1.amazonaws.com"
 
 log:
   level: "info" # debug, info, warn, error
@@ -370,6 +382,35 @@ Secret sources:
   `with_decryption` defaults to `true`, which is the expected setting for
   `SecureString` parameters.
 
+### AWS SigV4
+
+The `aws_sigv4` transform signs matching AWS requests at the proxy boundary.
+Workloads can hold dummy AWS credentials so AWS SDKs construct requests, while
+real AWS credentials stay in iron-proxy's environment.
+
+```yaml
+transforms:
+  - name: aws_sigv4
+    config:
+      signers:
+        - service: ses
+          region: eu-central-1
+          access_key_id_env: SES_AWS_ACCESS_KEY_ID
+          secret_access_key_env: SES_AWS_SECRET_ACCESS_KEY
+          session_token_env: SES_AWS_SESSION_TOKEN # optional
+          rules:
+            - host: "email.eu-central-1.amazonaws.com"
+              methods: ["POST"]
+```
+
+For matching requests, iron-proxy removes any inbound `Authorization`,
+`X-Amz-Date`, and `X-Amz-Security-Token` headers before signing. It then hashes
+the exact request body bytes, adds a fresh SigV4 `Authorization` header and
+`X-Amz-Date`, and adds `X-Amz-Security-Token` only when the configured session
+token environment variable has a value. If a request body exceeds
+`max_request_body_bytes`, signing fails closed rather than forwarding a request
+with a signature over truncated bytes.
+
 ### Judge
 
 The judge transform calls an LLM to produce an allow/deny decision for
@@ -439,13 +480,14 @@ informed this design.
 
 ### Body limits
 
-Transforms that inspect or forward request/response bodies (secrets body
-matching, gRPC transforms) operate on buffered bodies. Two global settings
-control the maximum buffer sizes:
+Transforms that inspect, sign, or forward request/response bodies (secrets body
+matching, `aws_sigv4`, gRPC transforms) operate on buffered bodies. Two global
+settings control the maximum buffer sizes:
 
 - **`max_request_body_bytes`** (default: `1048576` / 1 MiB): caps how much of
   the request body is buffered for transforms. Data beyond this limit is
-  truncated from the transform's perspective but still forwarded to upstream.
+  truncated from the transform's perspective. Body-preserving transforms such
+  as `aws_sigv4` fail closed if they detect truncation.
 - **`max_response_body_bytes`** (default: `0` / uncapped): caps how much of
   the response body is buffered. Set to `0` to buffer the full response, which
   is the right default for most workloads (e.g., npm packages, model weights).

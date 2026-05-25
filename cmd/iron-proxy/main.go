@@ -27,6 +27,7 @@ import (
 	// Register built-in transforms.
 	_ "github.com/ironsh/iron-proxy/internal/transform/allowlist"
 	_ "github.com/ironsh/iron-proxy/internal/transform/annotate"
+	_ "github.com/ironsh/iron-proxy/internal/transform/awssigv4"
 	_ "github.com/ironsh/iron-proxy/internal/transform/grpc"
 	_ "github.com/ironsh/iron-proxy/internal/transform/interactivepolicy"
 	_ "github.com/ironsh/iron-proxy/internal/transform/judge"

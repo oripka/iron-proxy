@@ -157,6 +157,20 @@ transforms:
         #   rules:
         #     - host: "api.openai.com"
 
+  # AWS SigV4 signing: the client can use dummy AWS credentials, while the
+  # proxy re-signs matching requests with real AWS credentials from env vars.
+  - name: aws_sigv4
+    config:
+      signers:
+        - service: ses
+          region: eu-central-1
+          access_key_id_env: SES_AWS_ACCESS_KEY_ID
+          secret_access_key_env: SES_AWS_SECRET_ACCESS_KEY
+          session_token_env: SES_AWS_SESSION_TOKEN # optional
+          rules:
+            - host: "email.eu-central-1.amazonaws.com"
+              methods: ["POST"]
+
   # gRPC transforms: each entry delegates to one external TransformService server.
   # Use multiple entries for multiple servers; they run in pipeline order.
   - name: grpc
