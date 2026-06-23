@@ -66,6 +66,7 @@ const (
 type config struct {
 	AccessKeyID         yaml.Node              `yaml:"access_key_id,omitempty"`
 	SecretAccessKey     yaml.Node              `yaml:"secret_access_key,omitempty"`
+	SessionToken        yaml.Node              `yaml:"session_token,omitempty"`
 	CredentialsProvider yaml.Node              `yaml:"credentials_provider,omitempty"`
 	AllowedRegions      []string               `yaml:"allowed_regions,omitempty"`
 	AllowedServices     []string               `yaml:"allowed_services,omitempty"`
@@ -151,7 +152,14 @@ func newFromConfig(c config, logger *slog.Logger, build sourceBuilder, buildCred
 		if err != nil {
 			return nil, fmt.Errorf("aws_auth: building secret_access_key source: %w", err)
 		}
-		creds = &staticSourceProvider{accessKey: accessKey, secretKey: secretKey}
+		var sessionToken secrets.Source
+		if !c.SessionToken.IsZero() {
+			sessionToken, err = build(c.SessionToken, logger)
+			if err != nil {
+				return nil, fmt.Errorf("aws_auth: building session_token source: %w", err)
+			}
+		}
+		creds = &staticSourceProvider{accessKey: accessKey, secretKey: secretKey, sessionToken: sessionToken}
 	}
 
 	rules, err := hostmatch.CompileRules(c.Rules, "aws_auth")
@@ -181,8 +189,9 @@ func newFromConfig(c config, logger *slog.Logger, build sourceBuilder, buildCred
 // staticSourceProvider adapts two secrets.Source values into an
 // aws.CredentialsProvider. The sources do their own TTL caching.
 type staticSourceProvider struct {
-	accessKey secrets.Source
-	secretKey secrets.Source
+	accessKey    secrets.Source
+	secretKey    secrets.Source
+	sessionToken secrets.Source
 }
 
 func (p *staticSourceProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
@@ -194,11 +203,19 @@ func (p *staticSourceProvider) Retrieve(ctx context.Context) (aws.Credentials, e
 	if err != nil {
 		return aws.Credentials{}, fmt.Errorf("secret_access_key: %w", err)
 	}
-	return aws.Credentials{
+	creds := aws.Credentials{
 		AccessKeyID:     ak,
 		SecretAccessKey: sk,
 		Source:          "iron-proxy aws_auth static",
-	}, nil
+	}
+	if p.sessionToken != nil {
+		token, err := p.sessionToken.Get(ctx)
+		if err != nil {
+			return aws.Credentials{}, fmt.Errorf("session_token: %w", err)
+		}
+		creds.SessionToken = token
+	}
+	return creds, nil
 }
 
 func buildAllowSet(items []string) map[string]struct{} {

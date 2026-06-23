@@ -363,6 +363,27 @@ rules:
 		require.Equal(t, int64(1), stub.calls.Load())
 	})
 
+	t.Run("static provider session token populates security-token header", func(t *testing.T) {
+		srcsWithToken := map[string]secrets.Source{
+			"AWS_ACCESS_KEY_ID":     &staticSource{name: "ak", value: "ASIAEXAMPLE"},
+			"AWS_SECRET_ACCESS_KEY": &staticSource{name: "sk", value: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
+			"AWS_SESSION_TOKEN":     &staticSource{name: "token", value: "session-token"},
+		}
+		a := buildTransformWith(t, `
+access_key_id:     {type: env, var: AWS_ACCESS_KEY_ID}
+secret_access_key: {type: env, var: AWS_SECRET_ACCESS_KEY}
+session_token:     {type: env, var: AWS_SESSION_TOKEN}
+rules:
+  - host: "*.amazonaws.com"
+`, mapBuilder(srcsWithToken))
+
+		req := signedRequest(t, http.MethodGet, "https://bucket.s3.us-east-1.amazonaws.com/key", "us-east-1", "s3", nil, 1<<20)
+		_, err := a.TransformRequest(context.Background(), newContext(), req)
+		require.NoError(t, err)
+		require.Equal(t, "session-token", req.Header.Get("X-Amz-Security-Token"))
+		require.Contains(t, req.Header.Get("Authorization"), "ASIAEXAMPLE")
+	})
+
 	t.Run("placeholder signature is stripped before re-signing", func(t *testing.T) {
 		a := buildTransformWith(t, minimalYAML, mapBuilder(srcs))
 		req := signedRequest(t, http.MethodPost, "https://bedrock-runtime.us-east-1.amazonaws.com/x", "us-east-1", "bedrock", []byte("{}"), 1<<20)
