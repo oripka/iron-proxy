@@ -155,6 +155,38 @@ func TestOTELAuditFunc_RejectedRequest(t *testing.T) {
 	assert.Equal(t, "allowlist", attrs["rejected_by"].AsString())
 }
 
+func TestOTELAuditFunc_StubbedRequest(t *testing.T) {
+	proc := &recordProcessor{}
+	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
+	auditFunc := NewOTELAuditFunc(provider)
+
+	auditFunc(&PipelineResult{
+		Host:       "oauth2.googleapis.com",
+		Method:     "POST",
+		Path:       "/token",
+		Action:     ActionStub,
+		StatusCode: 200,
+		Duration:   1 * time.Millisecond,
+		RequestTransforms: []TransformTrace{
+			{
+				Name:   "gcp_auth",
+				Action: ActionStub,
+			},
+		},
+	})
+
+	records := proc.Records()
+	require.Len(t, records, 1)
+
+	rec := records[0]
+	assert.Equal(t, log.SeverityInfo1, rec.Severity())
+	assert.Equal(t, "INFO", rec.SeverityText())
+
+	attrs := recordAttrs(rec)
+	assert.Equal(t, "stub", attrs["action"].AsString())
+	assert.Equal(t, "gcp_auth", attrs["stubbed_by"].AsString())
+}
+
 func TestOTELAuditFunc_ErroredRequest(t *testing.T) {
 	proc := &recordProcessor{}
 	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
@@ -179,6 +211,83 @@ func TestOTELAuditFunc_ErroredRequest(t *testing.T) {
 	attrs := recordAttrs(rec)
 	assert.Equal(t, "error", attrs["action"].AsString())
 	assert.Equal(t, "connection reset", attrs["error"].AsString())
+}
+
+func TestOTELAuditFunc_BodyCapture_PopulatesGroup(t *testing.T) {
+	proc := &recordProcessor{}
+	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
+	auditFunc := NewOTELAuditFunc(provider)
+
+	auditFunc(&PipelineResult{
+		Host:        "api.anthropic.com",
+		Method:      "POST",
+		Path:        "/v1/messages",
+		StartedAt:   time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		Duration:    50 * time.Millisecond,
+		Action:      ActionContinue,
+		StatusCode:  200,
+		BodyCapture: &fakeBodyCapture{body: `{"prompt":"hi"}`, truncated: false},
+	})
+
+	records := proc.Records()
+	require.Len(t, records, 1)
+
+	attrs := recordAttrs(records[0])
+	require.Contains(t, attrs, "body_capture")
+	bc := mapFromValue(attrs["body_capture"])
+	require.Contains(t, bc, "request_body")
+	require.Equal(t, `{"prompt":"hi"}`, bc["request_body"].AsString())
+	require.Contains(t, bc, "request_body_truncated")
+	require.Equal(t, false, bc["request_body_truncated"].AsBool())
+}
+
+func TestOTELAuditFunc_BodyCapture_TruncationFlagPropagates(t *testing.T) {
+	proc := &recordProcessor{}
+	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
+	auditFunc := NewOTELAuditFunc(provider)
+
+	auditFunc(&PipelineResult{
+		Host:        "api.openai.com",
+		Method:      "POST",
+		Path:        "/v1/chat/completions",
+		StartedAt:   time.Now(),
+		Duration:    50 * time.Millisecond,
+		Action:      ActionContinue,
+		StatusCode:  200,
+		BodyCapture: &fakeBodyCapture{body: "xxxxxxxxxx", truncated: true},
+	})
+
+	records := proc.Records()
+	require.Len(t, records, 1)
+
+	attrs := recordAttrs(records[0])
+	require.Contains(t, attrs, "body_capture")
+	bc := mapFromValue(attrs["body_capture"])
+	require.Contains(t, bc, "request_body_truncated")
+	require.True(t, bc["request_body_truncated"].AsBool())
+}
+
+func TestOTELAuditFunc_BodyCapture_NilOmitsGroup(t *testing.T) {
+	proc := &recordProcessor{}
+	provider := sdklog.NewLoggerProvider(sdklog.WithProcessor(proc))
+	auditFunc := NewOTELAuditFunc(provider)
+
+	auditFunc(&PipelineResult{
+		Host:       "example.com",
+		Method:     "GET",
+		Path:       "/",
+		StartedAt:  time.Now(),
+		Duration:   1 * time.Millisecond,
+		Action:     ActionContinue,
+		StatusCode: 200,
+		// BodyCapture: nil
+	})
+
+	records := proc.Records()
+	require.Len(t, records, 1)
+
+	attrs := recordAttrs(records[0])
+	require.NotContains(t, attrs, "body_capture")
 }
 
 func TestChainAuditFuncs(t *testing.T) {

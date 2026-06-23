@@ -3,8 +3,11 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/ironsh/iron-proxy/internal/dnsguard"
 )
 
 func validYAML() string {
@@ -272,6 +275,48 @@ transforms:
 	require.Equal(t, []string{"10.0.0.0/8"}, allowCfg.CIDRs)
 }
 
+func TestLoad_DNSDisabled(t *testing.T) {
+	t.Run("disabled skips proxy_ip requirement and listen default", func(t *testing.T) {
+		yaml := `
+dns:
+  enabled: false
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.NotNil(t, cfg.DNS.Enabled)
+		require.False(t, cfg.DNS.IsEnabled())
+		require.Equal(t, "", cfg.DNS.Listen)
+	})
+
+	t.Run("enabled by default still requires proxy_ip", func(t *testing.T) {
+		yaml := `
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.ErrorContains(t, err, "dns.proxy_ip is required")
+	})
+
+	t.Run("explicitly enabled gets listen default", func(t *testing.T) {
+		yaml := `
+dns:
+  enabled: true
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.True(t, cfg.DNS.IsEnabled())
+		require.Equal(t, ":53", cfg.DNS.Listen)
+	})
+}
+
 func TestLoad_SNIOnlyMode(t *testing.T) {
 	t.Run("ca cert not required", func(t *testing.T) {
 		yaml := `
@@ -333,4 +378,259 @@ tls:
 	require.Equal(t, "internal.example.com", cfg.DNS.Records[0].Name)
 	require.Equal(t, "A", cfg.DNS.Records[0].Type)
 	require.Equal(t, "10.0.0.5", cfg.DNS.Records[0].Value)
+}
+
+func TestLoad_UpstreamDenyCIDRs(t *testing.T) {
+	t.Run("default applied when unset", func(t *testing.T) {
+		cfg, err := Load(strings.NewReader(validYAML()))
+		require.NoError(t, err)
+		require.True(t, cfg.Proxy.UpstreamDenyCIDRs.Set)
+		require.Equal(t, dnsguard.DefaultDenyCIDRs, cfg.Proxy.UpstreamDenyCIDRs.Values)
+	})
+
+	t.Run("explicit empty list opts out", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+proxy:
+  upstream_deny_cidrs: []
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.True(t, cfg.Proxy.UpstreamDenyCIDRs.Set)
+		require.Empty(t, cfg.Proxy.UpstreamDenyCIDRs.Values)
+	})
+
+	t.Run("explicit list replaces defaults", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+proxy:
+  upstream_deny_cidrs:
+    - "169.254.169.254/32"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.Equal(t, []string{"169.254.169.254/32"}, cfg.Proxy.UpstreamDenyCIDRs.Values)
+	})
+
+	t.Run("bare IP rejected", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+proxy:
+  upstream_deny_cidrs:
+    - "1.2.3.4"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "proxy.upstream_deny_cidrs")
+		require.Contains(t, err.Error(), "must be CIDR notation")
+	})
+
+	t.Run("malformed CIDR rejected", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+proxy:
+  upstream_deny_cidrs:
+    - "not-an-ip/24"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "proxy.upstream_deny_cidrs")
+	})
+}
+
+func TestLoad_Management(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg, err := Load(strings.NewReader(validYAML()))
+		require.NoError(t, err)
+		require.Equal(t, "", cfg.Management.Listen)
+		require.Equal(t, "", cfg.Management.APIKeyEnv)
+	})
+
+	t.Run("api_key_env defaults when listen set", func(t *testing.T) {
+		t.Setenv("IRON_MANAGEMENT_API_KEY", "secret")
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+management:
+  listen: "127.0.0.1:9092"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.Equal(t, "127.0.0.1:9092", cfg.Management.Listen)
+		require.Equal(t, "IRON_MANAGEMENT_API_KEY", cfg.Management.APIKeyEnv)
+	})
+
+	t.Run("api_key_env override honored", func(t *testing.T) {
+		t.Setenv("CUSTOM_KEY", "secret")
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+management:
+  listen: "127.0.0.1:9092"
+  api_key_env: "CUSTOM_KEY"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.Equal(t, "CUSTOM_KEY", cfg.Management.APIKeyEnv)
+	})
+
+	t.Run("missing env var rejected", func(t *testing.T) {
+		// Ensure the default env var is unset for this test.
+		t.Setenv("IRON_MANAGEMENT_API_KEY", "")
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+management:
+  listen: "127.0.0.1:9092"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "IRON_MANAGEMENT_API_KEY")
+		require.Contains(t, err.Error(), "is not set")
+	})
+}
+
+func TestLoad_UpstreamResponseHeaderTimeout(t *testing.T) {
+	t.Run("default applied when unset", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.Equal(t, 30*time.Second, time.Duration(cfg.Proxy.UpstreamResponseHeaderTimeout))
+	})
+
+	t.Run("valid duration accepted", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+proxy:
+  upstream_response_header_timeout: "5m"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.Equal(t, 5*time.Minute, time.Duration(cfg.Proxy.UpstreamResponseHeaderTimeout))
+	})
+
+	t.Run("invalid duration rejected at parse", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+proxy:
+  upstream_response_header_timeout: "not-a-duration"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "invalid duration")
+	})
+
+	t.Run("negative duration rejected at validate", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+proxy:
+  upstream_response_header_timeout: "-5s"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "must be positive")
+	})
+}
+
+func TestLoad_ControlPlanePollInterval(t *testing.T) {
+	t.Run("default applied when unset", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.Equal(t, 10*time.Second, time.Duration(cfg.ControlPlane.PollInterval))
+	})
+
+	t.Run("valid duration accepted", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+control_plane:
+  poll_interval: "30s"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		cfg, err := Load(strings.NewReader(yaml))
+		require.NoError(t, err)
+		require.Equal(t, 30*time.Second, time.Duration(cfg.ControlPlane.PollInterval))
+	})
+
+	t.Run("invalid duration rejected at parse", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+control_plane:
+  poll_interval: "not-a-duration"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "invalid duration")
+	})
+
+	t.Run("negative duration rejected at validate", func(t *testing.T) {
+		yaml := `
+dns:
+  proxy_ip: "10.0.0.1"
+control_plane:
+  poll_interval: "-5s"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+`
+		_, err := Load(strings.NewReader(yaml))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "control_plane.poll_interval must be positive")
+	})
 }

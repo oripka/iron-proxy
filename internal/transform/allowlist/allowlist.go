@@ -36,15 +36,15 @@ func factory(cfg yaml.Node, _ *slog.Logger) (transform.Transformer, error) {
 	if err := cfg.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parsing allowlist config: %w", err)
 	}
-	return newFromConfig(c, hostmatch.DefaultResolver())
+	return newFromConfig(c)
 }
 
-func newFromConfig(cfg allowlistConfig, resolver hostmatch.Resolver) (*Allowlist, error) {
+func newFromConfig(cfg allowlistConfig) (*Allowlist, error) {
 	var rules []hostmatch.Rule
 
 	// Flat domains → rules with no method/path restrictions.
 	for _, d := range cfg.Domains {
-		m, err := hostmatch.New([]string{d}, nil, resolver)
+		m, err := hostmatch.New([]string{d}, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -53,7 +53,7 @@ func newFromConfig(cfg allowlistConfig, resolver hostmatch.Resolver) (*Allowlist
 
 	// Flat CIDRs → rules with no method/path restrictions.
 	for _, c := range cfg.CIDRs {
-		m, err := hostmatch.New(nil, []string{c}, resolver)
+		m, err := hostmatch.New(nil, []string{c})
 		if err != nil {
 			return nil, err
 		}
@@ -61,7 +61,7 @@ func newFromConfig(cfg allowlistConfig, resolver hostmatch.Resolver) (*Allowlist
 	}
 
 	// Explicit rules with optional method/path restrictions.
-	compiled, err := hostmatch.CompileRules(cfg.Rules, resolver, "allowlist")
+	compiled, err := hostmatch.CompileRules(cfg.Rules, "allowlist")
 	if err != nil {
 		return nil, err
 	}
@@ -72,18 +72,18 @@ func newFromConfig(cfg allowlistConfig, resolver hostmatch.Resolver) (*Allowlist
 
 // New creates an Allowlist from domain globs and CIDR strings.
 // All methods and paths are allowed. This is the backwards-compatible constructor.
-func New(domains []string, cidrs []string, resolver hostmatch.Resolver) (*Allowlist, error) {
-	return newFromConfig(allowlistConfig{Domains: domains, CIDRs: cidrs}, resolver)
+func New(domains []string, cidrs []string) (*Allowlist, error) {
+	return newFromConfig(allowlistConfig{Domains: domains, CIDRs: cidrs})
 }
 
 func (a *Allowlist) Name() string { return "allowlist" }
 
-func (a *Allowlist) TransformRequest(ctx context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
-	if req.Method == http.MethodConnect && hostmatch.MatchAnyRuleHost(ctx, a.rules, req) {
+func (a *Allowlist) TransformRequest(_ context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
+	if req.Method == http.MethodConnect && hostmatch.MatchAnyRuleHost(a.rules, req) {
 		tctx.Annotate("decision", "connect-host-allow")
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
-	if hostmatch.MatchAnyRule(ctx, a.rules, req) {
+	if hostmatch.MatchAnyRule(a.rules, req) {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 	if a.warn {

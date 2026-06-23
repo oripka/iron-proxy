@@ -6,33 +6,115 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"time"
 )
 
-// PollInterval is the base interval between sync calls.
-const PollInterval = 5 * time.Second
+// DefaultPollInterval is the default base interval between sync calls.
+const DefaultPollInterval = 10 * time.Second
+
+// SyncUpdate is the slice of a SyncResponse passed to the poller's update
+// callback. Fields are nil or JSON null when the control plane did not include
+// them in this sync.
+type SyncUpdate struct {
+	Rules      json.RawMessage
+	Secrets    json.RawMessage
+	Transforms json.RawMessage
+	MCP        json.RawMessage
+	Postgres   json.RawMessage
+}
+
+// Status is a snapshot of the poller's applied control-plane state. The
+// management API serves it so an operator (or the sandbox control plane)
+// can verify which principal's config this proxy is actually enforcing
+// before routing traffic through it.
+type Status struct {
+	ConfigHash      string    `json:"config_hash"`
+	PrincipalID     string    `json:"principal_id"`
+	PrincipalStatus string    `json:"principal_status"`
+	SyncedOnce      bool      `json:"synced_once"`
+	LastSyncAt      time.Time `json:"last_sync_at"`
+}
 
 // Poller periodically calls Sync and applies config updates.
 type Poller struct {
 	client     *Client
 	configHash string
-	onUpdate   func(rules json.RawMessage, secrets json.RawMessage) error
+	onUpdate   func(SyncUpdate) error
 	logger     *slog.Logger
+	interval   time.Duration
+
+	mu     sync.RWMutex
+	status Status
+	poke   chan struct{}
 }
 
 // NewPoller creates a new sync poller.
-func NewPoller(client *Client, initialConfigHash string, onUpdate func(json.RawMessage, json.RawMessage) error, logger *slog.Logger) *Poller {
+func NewPoller(client *Client, initialConfigHash string, onUpdate func(SyncUpdate) error, logger *slog.Logger) *Poller {
+	return NewPollerWithInterval(client, initialConfigHash, onUpdate, logger, DefaultPollInterval)
+}
+
+// NewPollerWithInterval creates a new sync poller with a custom base interval.
+func NewPollerWithInterval(client *Client, initialConfigHash string, onUpdate func(SyncUpdate) error, logger *slog.Logger, interval time.Duration) *Poller {
+	if interval <= 0 {
+		interval = DefaultPollInterval
+	}
 	return &Poller{
 		client:     client,
 		configHash: initialConfigHash,
 		onUpdate:   onUpdate,
 		logger:     logger,
+		interval:   interval,
+		poke:       make(chan struct{}, 1),
+	}
+}
+
+// Poke requests an immediate out-of-band sync. It never blocks: at most one
+// poke is queued, and a poke arriving while a sync is in flight coalesces
+// into the next loop iteration.
+func (p *Poller) Poke() {
+	select {
+	case p.poke <- struct{}{}:
+	default:
+	}
+}
+
+// Status returns a snapshot of the applied control-plane state.
+func (p *Poller) Status() Status {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.status
+}
+
+// SeedStatus records the result of a sync performed outside the poller (the
+// startup sync in managed mode) so Status reflects it before Run's first
+// iteration.
+func (p *Poller) SeedStatus(resp *SyncResponse) {
+	if resp == nil {
+		return
+	}
+	p.recordSync(resp)
+}
+
+func (p *Poller) recordSync(resp *SyncResponse) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.status.ConfigHash = resp.ConfigHash
+	p.status.SyncedOnce = true
+	p.status.LastSyncAt = time.Now().UTC()
+	// Hash-match responses omit the assignment fields; keep the last known
+	// values so Status stays meaningful between config changes.
+	if resp.Status != "" {
+		p.status.PrincipalStatus = resp.Status
+	}
+	if resp.PrincipalID != "" {
+		p.status.PrincipalID = resp.PrincipalID
 	}
 }
 
 // Run starts the polling loop. It performs an initial sync immediately, then
-// polls on PollInterval with ±10% jitter. Returns when ctx is canceled or
-// a revocation error is received.
+// polls on the configured interval with ±10% jitter; a Poke wakes it early. Returns when
+// ctx is canceled or a revocation error is received.
 func (p *Poller) Run(ctx context.Context) error {
 	if err := p.sync(ctx); err != nil {
 		if isRevocationError(err) {
@@ -42,7 +124,7 @@ func (p *Poller) Run(ctx context.Context) error {
 	}
 
 	for {
-		delay := jitteredInterval(PollInterval, 0.1)
+		delay := jitteredInterval(p.interval, 0.1)
 		timer := time.NewTimer(delay)
 
 		select {
@@ -50,6 +132,8 @@ func (p *Poller) Run(ctx context.Context) error {
 			timer.Stop()
 			return nil
 		case <-timer.C:
+		case <-p.poke:
+			timer.Stop()
 		}
 
 		if err := p.sync(ctx); err != nil {
@@ -70,21 +154,35 @@ func (p *Poller) sync(ctx context.Context) error {
 
 	hasRules := isNonNullJSON(resp.Rules)
 	hasSecrets := isNonNullJSON(resp.Secrets)
+	hasTransforms := isNonNullJSON(resp.Transforms)
+	hasMCP := isNonNullJSON(resp.MCP)
+	hasPostgres := isNonNullJSON(resp.Postgres)
 
-	if hasRules || hasSecrets {
+	if hasRules || hasSecrets || hasTransforms || hasMCP || hasPostgres {
 		p.logger.Info("config update received from control plane",
 			slog.String("config_hash", resp.ConfigHash),
 			slog.Bool("has_rules", hasRules),
 			slog.Bool("has_secrets", hasSecrets),
+			slog.Bool("has_transforms", hasTransforms),
+			slog.Bool("has_mcp", hasMCP),
+			slog.Bool("has_postgres", hasPostgres),
 		)
 		if p.onUpdate != nil {
-			if err := p.onUpdate(resp.Rules, resp.Secrets); err != nil {
+			if err := p.onUpdate(SyncUpdate{
+				Rules:      resp.Rules,
+				Secrets:    resp.Secrets,
+				Transforms: resp.Transforms,
+				MCP:        resp.MCP,
+				Postgres:   resp.Postgres,
+			}); err != nil {
 				p.logger.Error("applying config update", slog.String("error", err.Error()))
+				return err
 			}
 		}
 	}
 
 	p.configHash = resp.ConfigHash
+	p.recordSync(resp)
 	return nil
 }
 

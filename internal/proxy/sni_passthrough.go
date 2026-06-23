@@ -53,6 +53,11 @@ func (p *Proxy) serveSNIPassthrough(clientConn net.Conn) error {
 	pl, finish := p.beginPipelineRun(result)
 	defer finish()
 
+	if !p.isReady() {
+		markNotReady(result)
+		return nil
+	}
+
 	if sni == "" {
 		result.Action = transform.ActionReject
 		result.StatusCode = http.StatusBadRequest
@@ -88,9 +93,9 @@ func (p *Proxy) serveSNIPassthrough(clientConn net.Conn) error {
 		return fmt.Errorf("pipeline error for %q: %w", sni, pipelineErr)
 	}
 	if rejectResp != nil {
-		result.Action = transform.ActionReject
+		result.Action = transform.ShortCircuitAction(result.RequestTransforms)
 		result.StatusCode = rejectResp.StatusCode
-		p.logger.Info("sni passthrough rejected by transform",
+		p.logger.Info("sni passthrough short-circuited by transform",
 			slog.String("sni", sni),
 			slog.Int("status", rejectResp.StatusCode),
 		)
@@ -99,9 +104,11 @@ func (p *Proxy) serveSNIPassthrough(clientConn net.Conn) error {
 
 	// Dial upstream using the proxy's resolver so SNI → IP lookup goes via
 	// the configured upstream DNS (not the proxy's own intercepting server).
+	// The guard's DialControl rejects denied IPs after resolution.
 	dialer := &net.Dialer{
 		Timeout:  sniUpstreamDial,
 		Resolver: p.resolver,
+		Control:  p.guard.DialControl,
 	}
 	port := p.sniUpstreamPort
 	if port == "" {

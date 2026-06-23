@@ -61,6 +61,14 @@ func NewOTELAuditFunc(provider *sdklog.LoggerProvider) AuditFunc {
 				}
 			}
 		}
+		if result.Action == ActionStub {
+			for _, tr := range result.RequestTransforms {
+				if tr.Action == ActionStub {
+					attrs = append(attrs, log.String("stubbed_by", tr.Name))
+					break
+				}
+			}
+		}
 
 		if result.Err != nil {
 			attrs = append(attrs, log.String("error", result.Err.Error()))
@@ -77,6 +85,23 @@ func NewOTELAuditFunc(provider *sdklog.LoggerProvider) AuditFunc {
 				Key:   "response_transforms",
 				Value: transformTracesValue(result.ResponseTransforms),
 			})
+		}
+		if result.MCP != nil && result.MCP.MCPServer() != "" {
+			mcpKVs := []log.KeyValue{log.String("server", result.MCP.MCPServer())}
+			if msgs := result.MCP.MCPMessages(); len(msgs) > 0 {
+				vals := make([]log.Value, len(msgs))
+				for i, m := range msgs {
+					vals[i] = toLogValue(m)
+				}
+				mcpKVs = append(mcpKVs, log.KeyValue{Key: "messages", Value: log.SliceValue(vals...)})
+			}
+			attrs = append(attrs, log.KeyValue{Key: "mcp", Value: log.MapValue(mcpKVs...)})
+		}
+		if result.BodyCapture != nil && result.BodyCapture.RequestBody() != "" {
+			attrs = append(attrs, log.KeyValue{Key: "body_capture", Value: log.MapValue(
+				log.String("request_body", result.BodyCapture.RequestBody()),
+				log.Bool("request_body_truncated", result.BodyCapture.RequestBodyTruncated()),
+			)})
 		}
 
 		rec.AddAttributes(attrs...)
@@ -166,6 +191,10 @@ func toLogValue(v any) log.Value {
 		return log.BoolValue(x)
 	case string:
 		return log.StringValue(x)
+	case int:
+		return log.Int64Value(int64(x))
+	case int64:
+		return log.Int64Value(x)
 	case float64:
 		return log.Float64Value(x)
 	case []any:

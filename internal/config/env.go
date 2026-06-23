@@ -4,12 +4,19 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"strings"
+	"time"
 )
 
 // applyEnvOverrides layers IRON_* environment variables on top of an existing
 // Config. Only non-empty environment variables override the corresponding field.
 func applyEnvOverrides(cfg *Config) error {
+	if v := os.Getenv("IRON_DNS_ENABLED"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("IRON_DNS_ENABLED: %w", err)
+		}
+		cfg.DNS.Enabled = &b
+	}
 	if v := os.Getenv("IRON_DNS_LISTEN"); v != "" {
 		cfg.DNS.Listen = v
 	}
@@ -40,18 +47,11 @@ func applyEnvOverrides(cfg *Config) error {
 	if v := os.Getenv("IRON_METRICS_LISTEN"); v != "" {
 		cfg.Metrics.Listen = v
 	}
+	if v := os.Getenv("IRON_MANAGEMENT_LISTEN"); v != "" {
+		cfg.Management.Listen = v
+	}
 	if v := os.Getenv("IRON_LOG_LEVEL"); v != "" {
 		cfg.Log.Level = v
-	}
-	if v := os.Getenv("IRON_TAGS"); v != "" {
-		tags := make([]string, 0)
-		for _, t := range strings.Split(v, ",") {
-			t = strings.TrimSpace(t)
-			if t != "" {
-				tags = append(tags, t)
-			}
-		}
-		cfg.Tags = tags
 	}
 
 	if v := os.Getenv("IRON_PROXY_MAX_REQUEST_BODY_BYTES"); v != "" {
@@ -84,6 +84,22 @@ func applyEnvOverrides(cfg *Config) error {
 			return fmt.Errorf("IRON_TLS_LEAF_CERT_EXPIRY_HOURS: %w", err)
 		}
 		cfg.TLS.LeafCertExpiryHours = n
+	}
+
+	if v := os.Getenv("IRON_PROXY_UPSTREAM_RESPONSE_HEADER_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("IRON_PROXY_UPSTREAM_RESPONSE_HEADER_TIMEOUT: %w", err)
+		}
+		cfg.Proxy.UpstreamResponseHeaderTimeout = Duration(d)
+	}
+
+	if v := os.Getenv("IRON_CONTROL_PLANE_POLL_INTERVAL"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("IRON_CONTROL_PLANE_POLL_INTERVAL: %w", err)
+		}
+		cfg.ControlPlane.PollInterval = Duration(d)
 	}
 
 	return nil

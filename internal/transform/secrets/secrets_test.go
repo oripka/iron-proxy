@@ -3,6 +3,7 @@ package secrets
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -20,59 +21,71 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
+	"github.com/ironsh/iron-proxy/internal/headers"
 	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
 )
 
-// fakeResolver is a test secretResolver that returns preconfigured values.
-type fakeResolver struct {
-	secrets map[string]string // keyed by env var name or secret ID
+// fakeBuilder is a test secretSourceBuilder. Build only validates that the
+// source has a recognizable name field; the lookup against secrets (and any
+// failure) is deferred to Get.
+type fakeBuilder struct {
+	mu         sync.Mutex
+	secrets    map[string]string
+	fetchCalls map[string]int
 }
 
-func (f *fakeResolver) Resolve(_ context.Context, raw yaml.Node) (ResolveResult, error) {
-	// Try env config first, then AWS-backed configs.
+func (f *fakeBuilder) extractName(raw yaml.Node) (string, error) {
 	var env envConfig
 	if err := raw.Decode(&env); err == nil && env.Var != "" {
-		val, ok := f.secrets[env.Var]
-		if !ok || val == "" {
-			return ResolveResult{}, &resolveError{env.Var}
-		}
-		return ResolveResult{Name: env.Var, GetValue: staticValue(val)}, nil
+		return env.Var, nil
 	}
 	var sm awsSMConfig
 	if err := raw.Decode(&sm); err == nil && sm.SecretID != "" {
-		val, ok := f.secrets[sm.SecretID]
-		if !ok || val == "" {
-			return ResolveResult{}, &resolveError{sm.SecretID}
-		}
-		return ResolveResult{Name: sm.SecretID, GetValue: staticValue(val)}, nil
+		return sm.SecretID, nil
 	}
 	var ssm awsSSMConfig
 	if err := raw.Decode(&ssm); err == nil && ssm.Name != "" {
-		val, ok := f.secrets[ssm.Name]
-		if !ok || val == "" {
-			return ResolveResult{}, &resolveError{ssm.Name}
-		}
-		return ResolveResult{Name: ssm.Name, GetValue: staticValue(val)}, nil
+		return ssm.Name, nil
 	}
-	return ResolveResult{}, &resolveError{"unknown"}
+	return "", &resolveError{"unknown"}
+}
+
+func (f *fakeBuilder) Build(raw yaml.Node) (secretSource, error) {
+	name, err := f.extractName(raw)
+	if err != nil {
+		return nil, err
+	}
+	return newLazyValue(name, 0, defaultFailureTTL, slog.Default(), func(context.Context) (string, error) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.fetchCalls == nil {
+			f.fetchCalls = make(map[string]int)
+		}
+		f.fetchCalls[name]++
+		val, ok := f.secrets[name]
+		if !ok || val == "" {
+			return "", &resolveError{name}
+		}
+		return val, nil
+	}), nil
 }
 
 type resolveError struct{ name string }
 
 func (e *resolveError) Error() string { return e.name + " not found" }
 
-func testRegistry() resolverRegistry {
-	return resolverRegistry{
-		"env": &fakeResolver{secrets: map[string]string{
+func testRegistry() sourceBuilderRegistry {
+	return sourceBuilderRegistry{
+		"env": &fakeBuilder{secrets: map[string]string{
 			"OPENAI_API_KEY":    "sk-real-openai-key",
 			"ANTHROPIC_API_KEY": "sk-real-anthropic-key",
 			"INTERNAL_TOKEN":    "real-internal-token",
 		}},
-		"aws_sm": &fakeResolver{secrets: map[string]string{
+		"aws_sm": &fakeBuilder{secrets: map[string]string{
 			"arn:aws:sm:test": "aws-secret-value",
 		}},
-		"aws_ssm": &fakeResolver{secrets: map[string]string{
+		"aws_ssm": &fakeBuilder{secrets: map[string]string{
 			"/myapp/api-key": "ssm-secret-value",
 		}},
 	}
@@ -108,7 +121,7 @@ func defaultEntry(opts ...func(*secretEntry)) secretEntry {
 func makeSecrets(t *testing.T, entries []secretEntry) *Secrets {
 	t.Helper()
 	cfg := secretsConfig{Secrets: entries}
-	s, err := newFromConfig(context.Background(), cfg, testRegistry())
+	s, err := newFromConfig(cfg, testRegistry())
 	require.NoError(t, err)
 	return s
 }
@@ -138,9 +151,14 @@ func TestSecrets_HeaderSwap(t *testing.T) {
 }
 
 func TestSecrets_QueryParamSwap(t *testing.T) {
-	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
-		e.MatchHeaders = nil
-	})})
+	s := makeSecrets(t, []secretEntry{{
+		Source: envSource("OPENAI_API_KEY"),
+		Rules:  []hostmatch.RuleConfig{{Host: "api.openai.com"}},
+		Replace: &replaceConfig{
+			ProxyValue: "proxy-openai-abc123",
+			MatchQuery: true,
+		},
+	}})
 
 	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat?token=proxy-openai-abc123&other=value", nil)
 	req.Host = "api.openai.com"
@@ -150,6 +168,20 @@ func TestSecrets_QueryParamSwap(t *testing.T) {
 	require.Contains(t, req.URL.RawQuery, "sk-real-openai-key")
 	require.NotContains(t, req.URL.RawQuery, "proxy-openai-abc123")
 	require.Contains(t, req.URL.RawQuery, "other=value")
+}
+
+func TestSecrets_QueryParamNotSwappedByDefault(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = nil
+	})})
+
+	req := httptest.NewRequest("GET", "http://api.openai.com/v1/chat?token=proxy-openai-abc123&other=value", nil)
+	req.Host = "api.openai.com"
+
+	doTransform(t, s, req)
+
+	require.Contains(t, req.URL.RawQuery, "proxy-openai-abc123")
+	require.NotContains(t, req.URL.RawQuery, "sk-real-openai-key")
 }
 
 func TestSecrets_BodySwap(t *testing.T) {
@@ -262,21 +294,157 @@ func TestSecrets_EmptyMatchHeadersSearchesAll(t *testing.T) {
 	require.Equal(t, "sk-real-openai-key", req.Header.Get("X-Custom"))
 }
 
+func TestSecrets_RegexMatchHeaders(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{`/^X-.*-Key$/`}
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("X-Api-Key", "proxy-openai-abc123")
+	req.Header.Set("X-Other-Key", "proxy-openai-abc123")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123") // not matched
+	req.Header.Set("X-Trace", "proxy-openai-abc123")              // not matched
+
+	doTransform(t, s, req)
+
+	require.Equal(t, "sk-real-openai-key", req.Header.Get("X-Api-Key"))
+	require.Equal(t, "sk-real-openai-key", req.Header.Get("X-Other-Key"))
+	require.Equal(t, "Bearer proxy-openai-abc123", req.Header.Get("Authorization"))
+	require.Equal(t, "proxy-openai-abc123", req.Header.Get("X-Trace"))
+}
+
+func TestSecrets_RegexMatchHeaders_CaseInsensitiveByDefault(t *testing.T) {
+	// Lowercase pattern matches the canonical "Authorization" header.
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{`/^authorization$/`}
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+}
+
+func TestSecrets_RegexMatchHeaders_MixedWithLiteral(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{"Authorization", `/^X-Api-.*$/`}
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+	req.Header.Set("X-Api-Key", "proxy-openai-abc123")
+	req.Header.Set("X-Custom", "proxy-openai-abc123") // not matched
+
+	doTransform(t, s, req)
+
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+	require.Equal(t, "sk-real-openai-key", req.Header.Get("X-Api-Key"))
+	require.Equal(t, "proxy-openai-abc123", req.Header.Get("X-Custom"))
+}
+
+func TestSecrets_RegexMatchHeaders_OverlappingPatternsDontDoubleSwap(t *testing.T) {
+	// Two patterns that both match "X-Api-Key": ensure the swap runs once and
+	// doesn't replace twice (which would be idempotent for non-Basic, but the
+	// location annotation would duplicate).
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{"X-Api-Key", `/^X-.*$/`}
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("X-Api-Key", "proxy-openai-abc123")
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionContinue, res.Action)
+	require.Equal(t, "sk-real-openai-key", req.Header.Get("X-Api-Key"))
+}
+
+func TestSecrets_RegexMatchHeaders_RequireRejectsWhenNoMatch(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{`/^X-.*-Key$/`}
+		e.Require = true
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("X-Api-Key", "no-token-here")
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
+}
+
+func TestSecrets_RegexMatchHeaders_InvalidRegex(t *testing.T) {
+	cfg := secretsConfig{Secrets: []secretEntry{{
+		Source:       envSource("OPENAI_API_KEY"),
+		ProxyValue:   "proxy-tok",
+		MatchHeaders: []string{`/[invalid/`},
+		Rules:        []hostmatch.RuleConfig{{Host: "example.com"}},
+	}}}
+	_, err := newFromConfig(cfg, testRegistry())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid match_headers regex")
+}
+
+func TestSecrets_MatchHeaders_PreservesUserCasing(t *testing.T) {
+	// A match_headers entry with non-canonical casing matches the header
+	// case-insensitively but is written back with the user's casing.
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{"x-api-KEY"}
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("X-Api-Key", "proxy-openai-abc123") // canonical casing inbound
+
+	doTransform(t, s, req)
+
+	// Value swapped, and stored under the user-specified casing only.
+	// req.Header.Get canonicalizes its lookup, so it no longer finds it.
+	_, canonicalExists := req.Header["X-Api-Key"]
+	require.False(t, canonicalExists, "canonical key should be removed")
+	require.Equal(t, []string{"sk-real-openai-key"}, headers.Values(req.Header, "x-api-KEY"))
+}
+
+func TestSecrets_MatchHeaders_UserCasingInLocations(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{"x-api-key"}
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("X-Api-Key", "proxy-openai-abc123")
+
+	tctx := &transform.TransformContext{}
+	res, err := s.TransformRequest(context.Background(), tctx, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionContinue, res.Action)
+
+	// The swapped location annotation reports the user's header casing.
+	encoded, err := json.Marshal(tctx.DrainAnnotations()["swapped"])
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), `"header:x-api-key"`)
+}
+
+func TestSecrets_RegexMatchHeaders_KeepsExistingCasing(t *testing.T) {
+	// Regex matches carry no user-specified casing, so the header's
+	// existing casing on the request is preserved.
+	s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+		e.MatchHeaders = []string{`/^x-api-key$/`}
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("X-Api-Key", "proxy-openai-abc123")
+
+	doTransform(t, s, req)
+
+	require.Equal(t, []string{"sk-real-openai-key"}, req.Header["X-Api-Key"])
+}
+
 func TestSecrets_ConfigErrors(t *testing.T) {
 	tests := []struct {
 		name   string
 		cfg    secretsConfig
 		errMsg string
 	}{
-		{
-			name: "missing env var",
-			cfg: secretsConfig{Secrets: []secretEntry{{
-				Source:     envSource("NONEXISTENT_VAR"),
-				ProxyValue: "proxy-value",
-				Rules:      []hostmatch.RuleConfig{{Host: "example.com"}},
-			}}},
-			errMsg: "NONEXISTENT_VAR",
-		},
 		{
 			name: "no mode specified",
 			cfg: secretsConfig{Secrets: []secretEntry{{
@@ -306,7 +474,7 @@ func TestSecrets_ConfigErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := newFromConfig(context.Background(), tt.cfg, testRegistry())
+			_, err := newFromConfig(tt.cfg, testRegistry())
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tt.errMsg)
 		})
@@ -592,13 +760,15 @@ func TestSecrets_MixedSourceTypes(t *testing.T) {
 
 	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
 	require.Equal(t, "aws-secret-value", req.Header.Get("X-Api-Key"))
-	require.Equal(t, "ssm-secret-value", req.Header.Get("X-SSM-Key"))
+	// match_headers preserves the user's casing, so "X-SSM-Key" is written
+	// back verbatim rather than canonicalized to "X-Ssm-Key".
+	require.Equal(t, []string{"ssm-secret-value"}, headers.Values(req.Header, "X-SSM-Key"))
 }
 
-// --- End-to-end tests with real awsSMResolver and mock AWS client ---
+// --- End-to-end tests with real awsSMBuilder and mock AWS client ---
 
-func awsSMRegistry(client smClient) resolverRegistry {
-	return resolverRegistry{"aws_sm": &awsSMResolver{
+func awsSMRegistry(client smClient) sourceBuilderRegistry {
+	return sourceBuilderRegistry{"aws_sm": &awsSMBuilder{
 		clientFor: func(_ context.Context, _ string) (smClient, error) {
 			return client, nil
 		},
@@ -609,7 +779,7 @@ func awsSMRegistry(client smClient) resolverRegistry {
 func makeAWSSMSecrets(t *testing.T, client smClient, entries []secretEntry) *Secrets {
 	t.Helper()
 	cfg := secretsConfig{Secrets: entries}
-	s, err := newFromConfig(context.Background(), cfg, awsSMRegistry(client))
+	s, err := newFromConfig(cfg, awsSMRegistry(client))
 	require.NoError(t, err)
 	return s
 }
@@ -706,30 +876,30 @@ func TestAWSSM_EndToEnd_TTLRefresh(t *testing.T) {
 		MatchHeaders: []string{"Authorization"},
 		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
 	}})
-	// Initial resolve is call 1 (value-1).
+	require.Equal(t, int32(0), callCount.Load(), "lazy: no fetch before first request")
 
-	// First request: TTL=1ns is already expired, so this triggers a refresh (call 2).
+	// First request: triggers initial fetch (call 1, value-1).
 	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("Authorization", "Bearer proxy-tok")
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer value-1", req.Header.Get("Authorization"))
+
+	// Second request: TTL already expired, triggers refresh (call 2, value-2).
+	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 	doTransform(t, s, req)
 	require.Equal(t, "Bearer value-2", req.Header.Get("Authorization"))
 
-	// Second request: triggers another refresh (call 3).
-	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
-	req.Host = "api.example.com"
-	req.Header.Set("Authorization", "Bearer proxy-tok")
-	doTransform(t, s, req)
-	require.Equal(t, "Bearer value-3", req.Header.Get("Authorization"))
-
-	require.GreaterOrEqual(t, callCount.Load(), int32(3))
+	require.GreaterOrEqual(t, callCount.Load(), int32(2))
 }
 
 func TestAWSSM_EndToEnd_TTLServesStaleOnError(t *testing.T) {
 	var callCount atomic.Int32
 	client := &mockSMClient{fn: func(_ context.Context, _ *secretsmanager.GetSecretValueInput) (*secretsmanager.GetSecretValueOutput, error) {
 		n := callCount.Add(1)
-		// First call (initial resolve at startup) succeeds.
+		// First fetch (lazy, on first request) succeeds.
 		if n == 1 {
 			return &secretsmanager.GetSecretValueOutput{
 				SecretString: aws.String("good-value"),
@@ -749,23 +919,30 @@ func TestAWSSM_EndToEnd_TTLServesStaleOnError(t *testing.T) {
 		MatchHeaders: []string{"Authorization"},
 		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
 	}})
-	require.Equal(t, int32(1), callCount.Load()) // initial resolve
+	require.Equal(t, int32(0), callCount.Load(), "lazy: no fetch before first request")
 
-	// First request: TTL expired, refresh fails, stale "good-value" served.
+	// First request: lazy fetch succeeds and caches "good-value".
 	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 	doTransform(t, s, req)
 	require.Equal(t, "Bearer good-value", req.Header.Get("Authorization"))
 
-	// Second request: same — refresh fails again, stale value still served.
+	// Second request: TTL expired, refresh fails, stale "good-value" served.
 	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
 	req.Host = "api.example.com"
 	req.Header.Set("Authorization", "Bearer proxy-tok")
 	doTransform(t, s, req)
 	require.Equal(t, "Bearer good-value", req.Header.Get("Authorization"))
 
-	// At least 2 refresh attempts beyond the initial resolve.
+	// Third request: same — refresh fails again, stale value still served.
+	req = httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("Authorization", "Bearer proxy-tok")
+	doTransform(t, s, req)
+	require.Equal(t, "Bearer good-value", req.Header.Get("Authorization"))
+
+	// At least 2 refresh attempts beyond the initial successful fetch.
 	require.GreaterOrEqual(t, callCount.Load(), int32(3))
 }
 
@@ -791,10 +968,10 @@ func TestAWSSM_EndToEnd_RequireRejectsWithoutToken(t *testing.T) {
 	require.Equal(t, transform.ActionReject, res.Action)
 }
 
-// --- End-to-end tests with real awsSSMResolver and mock AWS client ---
+// --- End-to-end tests with real awsSSMBuilder and mock AWS client ---
 
-func awsSSMRegistry(client ssmClient) resolverRegistry {
-	return resolverRegistry{"aws_ssm": &awsSSMResolver{
+func awsSSMRegistry(client ssmClient) sourceBuilderRegistry {
+	return sourceBuilderRegistry{"aws_ssm": &awsSSMBuilder{
 		clientFor: func(_ context.Context, _ string) (ssmClient, error) {
 			return client, nil
 		},
@@ -805,7 +982,7 @@ func awsSSMRegistry(client ssmClient) resolverRegistry {
 func makeAWSSSMSecrets(t *testing.T, client ssmClient, entries []secretEntry) *Secrets {
 	t.Helper()
 	cfg := secretsConfig{Secrets: entries}
-	s, err := newFromConfig(context.Background(), cfg, awsSSMRegistry(client))
+	s, err := newFromConfig(cfg, awsSSMRegistry(client))
 	require.NoError(t, err)
 	return s
 }
@@ -878,6 +1055,40 @@ func TestInject_HeaderNoFormatter(t *testing.T) {
 	doTransform(t, s, req)
 
 	require.Equal(t, "sk-real-openai-key", req.Header.Get("X-Api-Key"))
+}
+
+func TestInject_HeaderPreservesUserCasing(t *testing.T) {
+	// The configured header casing is sent over the wire verbatim rather
+	// than being canonicalized.
+	s := makeSecrets(t, []secretEntry{injectEntry(func(e *secretEntry) {
+		e.Inject.Formatter = ""
+		e.Inject.Header = "X-API-KEY"
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	doTransform(t, s, req)
+
+	// Stored under the user's casing; canonical lookup no longer finds it.
+	require.Equal(t, []string{"sk-real-openai-key"}, headers.Values(req.Header, "X-API-KEY"))
+	_, canonicalExists := req.Header["X-Api-Key"]
+	require.False(t, canonicalExists, "canonical key should not be present")
+}
+
+func TestInject_HeaderReplacesExistingCanonicalValue(t *testing.T) {
+	// An inbound header under the canonical name is replaced, not duplicated,
+	// when the configured casing differs.
+	s := makeSecrets(t, []secretEntry{injectEntry(func(e *secretEntry) {
+		e.Inject.Formatter = ""
+		e.Inject.Header = "X-API-KEY"
+	})})
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("X-Api-Key", "stale-value")
+	doTransform(t, s, req)
+
+	require.Equal(t, []string{"sk-real-openai-key"}, headers.Values(req.Header, "X-API-KEY"))
+	_, canonicalExists := req.Header["X-Api-Key"]
+	require.False(t, canonicalExists, "stale canonical header should be removed")
 }
 
 func TestInject_Base64Formatter(t *testing.T) {
@@ -1040,11 +1251,89 @@ func TestInject_ConfigErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := newFromConfig(context.Background(), tt.cfg, testRegistry())
+			_, err := newFromConfig(tt.cfg, testRegistry())
 			require.Error(t, err)
 			require.Contains(t, err.Error(), tt.errMsg)
 		})
 	}
+}
+
+// --- Path mode tests ---
+
+func telegramReq(path string) *http.Request {
+	req := httptest.NewRequest("POST", "http://api.telegram.org"+path, nil)
+	req.Host = "api.telegram.org"
+	return req
+}
+
+func telegramReplaceEntry(opts ...func(*secretEntry)) secretEntry {
+	e := secretEntry{
+		Source: envSource("OPENAI_API_KEY"),
+		Replace: &replaceConfig{
+			ProxyValue:   "proxy-tg-token",
+			MatchHeaders: []string{}, // disable header scanning
+			MatchPath:    true,
+		},
+		Rules: []hostmatch.RuleConfig{{Host: "api.telegram.org"}},
+	}
+	for _, opt := range opts {
+		opt(&e)
+	}
+	return e
+}
+
+func TestReplace_MatchPath(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{telegramReplaceEntry()})
+
+	req := telegramReq("/botproxy-tg-token/sendMessage")
+	doTransform(t, s, req)
+
+	require.Equal(t, "/botsk-real-openai-key/sendMessage", req.URL.Path)
+	require.Empty(t, req.URL.RawPath)
+}
+
+func TestReplace_MatchPath_NoMatchInPath(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{telegramReplaceEntry()})
+
+	req := telegramReq("/sendMessage")
+	doTransform(t, s, req)
+
+	require.Equal(t, "/sendMessage", req.URL.Path)
+}
+
+func TestReplace_MatchPath_RequireRejectsWhenAbsent(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{telegramReplaceEntry(func(e *secretEntry) {
+		e.Replace.Require = true
+	})})
+
+	req := telegramReq("/sendMessage")
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
+}
+
+func TestReplace_MatchPath_ClearsRawPath(t *testing.T) {
+	s := makeSecrets(t, []secretEntry{telegramReplaceEntry()})
+
+	req := telegramReq("/botproxy-tg-token/sendMessage")
+	// Simulate net/http populating an encoded RawPath alongside Path.
+	req.URL.RawPath = "/botproxy-tg-token/sendMessage"
+	doTransform(t, s, req)
+
+	require.Equal(t, "/botsk-real-openai-key/sendMessage", req.URL.Path)
+	require.Empty(t, req.URL.RawPath, "RawPath must be cleared so net/http re-encodes from Path")
+}
+
+func TestReplace_MatchPath_DefaultOff(t *testing.T) {
+	// Without match_path, a proxy_value embedded in the path must be left alone.
+	s := makeSecrets(t, []secretEntry{telegramReplaceEntry(func(e *secretEntry) {
+		e.Replace.MatchPath = false
+	})})
+
+	req := telegramReq("/botproxy-tg-token/sendMessage")
+	doTransform(t, s, req)
+
+	require.Equal(t, "/botproxy-tg-token/sendMessage", req.URL.Path)
 }
 
 func TestInject_ConcurrentSafety(t *testing.T) {
@@ -1061,4 +1350,157 @@ func TestInject_ConcurrentSafety(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// --- Lazy resolution + require-on-resolve-failure tests ---
+
+func missingSecretRegistry() sourceBuilderRegistry {
+	return sourceBuilderRegistry{
+		"env": &fakeBuilder{secrets: map[string]string{}},
+	}
+}
+
+func missingSecretEntry(opts ...func(*secretEntry)) secretEntry {
+	e := secretEntry{
+		Source:       envSource("MISSING"),
+		ProxyValue:   "proxy-tok",
+		MatchHeaders: []string{"Authorization"},
+		Rules:        []hostmatch.RuleConfig{{Host: "api.example.com"}},
+	}
+	for _, opt := range opts {
+		opt(&e)
+	}
+	return e
+}
+
+func TestLazy_PipelineBuildsWhenSecretBackendUnreachable(t *testing.T) {
+	cfg := secretsConfig{Secrets: []secretEntry{missingSecretEntry()}}
+	s, err := newFromConfig(cfg, missingSecretRegistry())
+	require.NoError(t, err, "pipeline must build even when the secret can't be fetched")
+	require.NotNil(t, s)
+}
+
+func TestLazy_RequestSkipsUnavailableSecretWhenNotRequired(t *testing.T) {
+	cfg := secretsConfig{Secrets: []secretEntry{missingSecretEntry()}}
+	s, err := newFromConfig(cfg, missingSecretRegistry())
+	require.NoError(t, err)
+
+	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("Authorization", "Bearer proxy-tok")
+
+	tctx := &transform.TransformContext{}
+	res, err := s.TransformRequest(context.Background(), tctx, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionContinue, res.Action)
+	// Secret unavailable: header is left as-is.
+	require.Equal(t, "Bearer proxy-tok", req.Header.Get("Authorization"))
+}
+
+func TestLazy_RequestRejectedWhenReplaceRequireAndSecretUnavailable(t *testing.T) {
+	cfg := secretsConfig{Secrets: []secretEntry{missingSecretEntry(func(e *secretEntry) {
+		e.Require = true
+	})}}
+	s, err := newFromConfig(cfg, missingSecretRegistry())
+	require.NoError(t, err)
+
+	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+	req.Header.Set("Authorization", "Bearer proxy-tok")
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
+}
+
+func TestLazy_RequestRejectedWhenInjectRequireAndSecretUnavailable(t *testing.T) {
+	cfg := secretsConfig{Secrets: []secretEntry{{
+		Source: envSource("MISSING"),
+		Inject: &injectConfig{Header: "Authorization", Require: true},
+		Rules:  []hostmatch.RuleConfig{{Host: "api.example.com"}},
+	}}}
+	s, err := newFromConfig(cfg, missingSecretRegistry())
+	require.NoError(t, err)
+
+	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionReject, res.Action)
+}
+
+func TestLazy_InjectRequireFalseSkipsOnUnavailable(t *testing.T) {
+	cfg := secretsConfig{Secrets: []secretEntry{{
+		Source: envSource("MISSING"),
+		Inject: &injectConfig{Header: "Authorization"},
+		Rules:  []hostmatch.RuleConfig{{Host: "api.example.com"}},
+	}}}
+	s, err := newFromConfig(cfg, missingSecretRegistry())
+	require.NoError(t, err)
+
+	req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+	req.Host = "api.example.com"
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionContinue, res.Action)
+	// Secret unavailable + require=false: header not set.
+	require.Empty(t, req.Header.Get("Authorization"))
+}
+
+func TestLazy_MixedAvailableAndUnavailable(t *testing.T) {
+	registry := sourceBuilderRegistry{
+		"env": &fakeBuilder{secrets: map[string]string{
+			"OPENAI_API_KEY": "sk-real-openai-key",
+		}},
+	}
+	cfg := secretsConfig{Secrets: []secretEntry{
+		{
+			Source:       envSource("OPENAI_API_KEY"),
+			ProxyValue:   "proxy-openai-abc123",
+			MatchHeaders: []string{"Authorization"},
+			Rules:        []hostmatch.RuleConfig{{Host: "api.openai.com"}},
+		},
+		{
+			Source:       envSource("MISSING"),
+			ProxyValue:   "proxy-other",
+			MatchHeaders: []string{"X-Other"},
+			Rules:        []hostmatch.RuleConfig{{Host: "api.openai.com"}},
+		},
+	}}
+	s, err := newFromConfig(cfg, registry)
+	require.NoError(t, err)
+
+	req := openaiReq("GET", "/v1/chat")
+	req.Header.Set("Authorization", "Bearer proxy-openai-abc123")
+	req.Header.Set("X-Other", "proxy-other")
+
+	res, err := s.TransformRequest(context.Background(), &transform.TransformContext{}, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionContinue, res.Action)
+	require.Equal(t, "Bearer sk-real-openai-key", req.Header.Get("Authorization"))
+	// Missing secret: X-Other untouched.
+	require.Equal(t, "proxy-other", req.Header.Get("X-Other"))
+}
+
+func TestLazy_FailureCachedAcrossRequests(t *testing.T) {
+	fr := &fakeBuilder{secrets: map[string]string{}}
+	registry := sourceBuilderRegistry{"env": fr}
+
+	cfg := secretsConfig{Secrets: []secretEntry{missingSecretEntry()}}
+	s, err := newFromConfig(cfg, registry)
+	require.NoError(t, err)
+
+	for range 5 {
+		req := httptest.NewRequest("GET", "http://api.example.com/v1", nil)
+		req.Host = "api.example.com"
+		req.Header.Set("Authorization", "Bearer proxy-tok")
+		doTransform(t, s, req)
+	}
+
+	// Lazy fetch happened only once; subsequent requests served the cached error.
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	require.Equal(t, 1, fr.fetchCalls["MISSING"])
 }

@@ -85,6 +85,71 @@ func TestAudit_RejectedRequest(t *testing.T) {
 	require.Equal(t, float64(403), audit["status_code"])
 }
 
+func TestAudit_StubbedRequest(t *testing.T) {
+	result := &PipelineResult{
+		Host:       "oauth2.googleapis.com",
+		Method:     "POST",
+		Path:       "/token",
+		RemoteAddr: "10.16.0.5:43216",
+		SNI:        "oauth2.googleapis.com",
+		StartedAt:  time.Now(),
+		Duration:   80 * time.Microsecond,
+		Action:     ActionStub,
+		StatusCode: 200,
+		RequestTransforms: []TransformTrace{
+			{Name: "gcp_auth", Action: ActionStub, Duration: 80 * time.Microsecond,
+				Annotations: map[string]any{"stubbed": "oauth2_token_endpoint"}},
+		},
+	}
+
+	parsed, _ := captureAuditLog(result)
+
+	require.Equal(t, "INFO", parsed["level"])
+	require.Equal(t, "request", parsed["msg"])
+	require.Equal(t, "gcp_auth", parsed["stubbed_by"])
+
+	audit := parsed["audit"].(map[string]any)
+	require.Equal(t, "stub", audit["action"])
+	require.Equal(t, float64(200), audit["status_code"])
+}
+
+func TestAudit_TunnelInfo(t *testing.T) {
+	result := &PipelineResult{
+		Host:       "example.com",
+		Method:     "GET",
+		Path:       "/",
+		RemoteAddr: "10.16.0.5:43213",
+		SNI:        "example.com",
+		StartedAt:  time.Now(),
+		Duration:   time.Millisecond,
+		Action:     ActionContinue,
+		StatusCode: 200,
+		Tunnel: &TunnelInfo{
+			Target: "example.com:443",
+			RequestTransforms: []TransformTrace{
+				{
+					Name:        "auth",
+					Action:      ActionContinue,
+					Duration:    250 * time.Microsecond,
+					Annotations: map[string]any{"user_id": "alice"},
+				},
+			},
+		},
+	}
+
+	parsed, _ := captureAuditLog(result)
+
+	tunnel := parsed["tunnel"].(map[string]any)
+	require.Equal(t, "example.com:443", tunnel["target"])
+	traces := tunnel["request_transforms"].([]any)
+	require.Len(t, traces, 1)
+	trace := traces[0].(map[string]any)
+	require.Equal(t, "auth", trace["name"])
+	require.Equal(t, "allow", trace["action"])
+	annotations := trace["annotations"].(map[string]any)
+	require.Equal(t, "alice", annotations["user_id"])
+}
+
 func TestAudit_ErroredRequest(t *testing.T) {
 	result := &PipelineResult{
 		Host:       "api.openai.com",
@@ -113,6 +178,31 @@ func TestAudit_ErroredRequest(t *testing.T) {
 	audit := parsed["audit"].(map[string]any)
 	require.Equal(t, "error", audit["action"])
 	require.Equal(t, float64(502), audit["status_code"])
+}
+
+func TestAudit_ClientCanceled(t *testing.T) {
+	result := &PipelineResult{
+		Host:           "api.openai.com",
+		Method:         "POST",
+		Path:           "/v1/chat/completions",
+		RemoteAddr:     "10.16.0.5:43215",
+		SNI:            "api.openai.com",
+		StartedAt:      time.Now(),
+		Duration:       3200 * time.Microsecond,
+		Action:         ActionContinue,
+		StatusCode:     200,
+		ClientCanceled: true,
+	}
+
+	parsed, raw := captureAuditLog(result)
+
+	require.Equal(t, "INFO", parsed["level"])
+	require.Equal(t, "request", parsed["msg"])
+	require.NotContains(t, raw, "\"error\"")
+
+	audit := parsed["audit"].(map[string]any)
+	require.Equal(t, "client_cancel", audit["action"])
+	require.Equal(t, float64(200), audit["status_code"])
 }
 
 func TestAudit_TransformTraceOrder(t *testing.T) {
@@ -175,4 +265,98 @@ func TestAudit_EmptyTransforms(t *testing.T) {
 	require.Equal(t, "INFO", parsed["level"])
 	audit := parsed["audit"].(map[string]any)
 	require.Equal(t, "allow", audit["action"])
+}
+
+// fakeBodyCapture is a test-only implementation of BodyCapture for exercising
+// the audit emitters without pulling in the bodycapture package (which would
+// cause an import cycle via its dependency on transform).
+type fakeBodyCapture struct {
+	body      string
+	truncated bool
+}
+
+func (f *fakeBodyCapture) RequestBody() string        { return f.body }
+func (f *fakeBodyCapture) RequestBodyTruncated() bool { return f.truncated }
+
+func TestAudit_BodyCapture_PopulatesGroup(t *testing.T) {
+	result := &PipelineResult{
+		Host:        "api.anthropic.com",
+		Method:      "POST",
+		Path:        "/v1/messages",
+		StartedAt:   time.Now(),
+		Duration:    1 * time.Millisecond,
+		Action:      ActionContinue,
+		StatusCode:  200,
+		BodyCapture: &fakeBodyCapture{body: `{"prompt":"hi"}`, truncated: false},
+	}
+
+	parsed, raw := captureAuditLog(result)
+
+	// request_body / request_body_truncated land inside a `body_capture` group
+	// at the root of the record — namespaced like the `mcp` and `audit`
+	// groups, not loose at the root.
+	bc, ok := parsed["body_capture"].(map[string]any)
+	require.True(t, ok, "body_capture group should be present. raw=%s", raw)
+	require.Equal(t, `{"prompt":"hi"}`, bc["request_body"])
+	require.Equal(t, false, bc["request_body_truncated"])
+}
+
+func TestAudit_BodyCapture_TruncationFlagPropagates(t *testing.T) {
+	result := &PipelineResult{
+		Host:        "api.openai.com",
+		Method:      "POST",
+		Path:        "/v1/chat/completions",
+		StartedAt:   time.Now(),
+		Duration:    1 * time.Millisecond,
+		Action:      ActionContinue,
+		StatusCode:  200,
+		BodyCapture: &fakeBodyCapture{body: "xxxxxxxxxxxxxxxx", truncated: true},
+	}
+
+	parsed, raw := captureAuditLog(result)
+
+	bc, ok := parsed["body_capture"].(map[string]any)
+	require.True(t, ok, "body_capture group should be present. raw=%s", raw)
+	require.Equal(t, true, bc["request_body_truncated"])
+}
+
+func TestAudit_BodyCapture_NilOmitsGroup(t *testing.T) {
+	// No body_capture rule matched — BodyCapture is nil. Audit line must
+	// NOT include the body_capture group.
+	result := &PipelineResult{
+		Host:       "example.com",
+		Method:     "GET",
+		Path:       "/",
+		StartedAt:  time.Now(),
+		Duration:   1 * time.Millisecond,
+		Action:     ActionContinue,
+		StatusCode: 200,
+	}
+
+	parsed, raw := captureAuditLog(result)
+
+	_, hasGroup := parsed["body_capture"]
+	require.False(t, hasGroup, "body_capture group should be absent when BodyCapture is nil. raw=%s", raw)
+}
+
+func TestAudit_BodyCapture_EmptyBodyOmitsGroup(t *testing.T) {
+	// BodyCapture is set but RequestBody() is empty (defensive — shouldn't
+	// happen in practice because the transform skips empty bodies, but the
+	// audit emitter checks `!= ""` too). Audit line must not include the
+	// body_capture group.
+	result := &PipelineResult{
+		Host:        "example.com",
+		Method:      "GET",
+		Path:        "/",
+		StartedAt:   time.Now(),
+		Duration:    1 * time.Millisecond,
+		Action:      ActionContinue,
+		StatusCode:  200,
+		BodyCapture: &fakeBodyCapture{body: "", truncated: false},
+	}
+
+	parsed, _ := captureAuditLog(result)
+
+	_, hasGroup := parsed["body_capture"]
+	require.False(t, hasGroup, "body_capture group should be absent when RequestBody() is empty")
 }

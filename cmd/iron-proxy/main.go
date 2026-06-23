@@ -11,7 +11,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -19,23 +18,29 @@ import (
 	"github.com/ironsh/iron-proxy/internal/config"
 	"github.com/ironsh/iron-proxy/internal/controlplane"
 	idns "github.com/ironsh/iron-proxy/internal/dns"
+	"github.com/ironsh/iron-proxy/internal/dnsguard"
+	"github.com/ironsh/iron-proxy/internal/management"
+	"github.com/ironsh/iron-proxy/internal/mcp"
 	"github.com/ironsh/iron-proxy/internal/metrics"
 	iotel "github.com/ironsh/iron-proxy/internal/otel"
+	"github.com/ironsh/iron-proxy/internal/postgres"
 	"github.com/ironsh/iron-proxy/internal/proxy"
 	"github.com/ironsh/iron-proxy/internal/transform"
+	"github.com/ironsh/iron-proxy/internal/version"
 
 	// Register built-in transforms.
 	_ "github.com/ironsh/iron-proxy/internal/transform/allowlist"
 	_ "github.com/ironsh/iron-proxy/internal/transform/annotate"
-	_ "github.com/ironsh/iron-proxy/internal/transform/awssigv4"
+	_ "github.com/ironsh/iron-proxy/internal/transform/awsauth"
+	_ "github.com/ironsh/iron-proxy/internal/transform/bodycapture"
+	_ "github.com/ironsh/iron-proxy/internal/transform/gcpauth"
 	_ "github.com/ironsh/iron-proxy/internal/transform/grpc"
-	_ "github.com/ironsh/iron-proxy/internal/transform/interactivepolicy"
+	_ "github.com/ironsh/iron-proxy/internal/transform/headerallowlist"
+	_ "github.com/ironsh/iron-proxy/internal/transform/hmacsign"
 	_ "github.com/ironsh/iron-proxy/internal/transform/judge"
+	_ "github.com/ironsh/iron-proxy/internal/transform/oauth"
 	_ "github.com/ironsh/iron-proxy/internal/transform/secrets"
 )
-
-// version is set at build time via -ldflags.
-var version = "dev"
 
 func main() {
 	if len(os.Args) > 1 {
@@ -43,17 +48,14 @@ func main() {
 		case "generate-ca":
 			runGenerateCA(os.Args[2:])
 			return
-		case "init":
-			runInit(os.Args[2:])
-			return
 		case "version", "--version", "-v":
-			fmt.Println(version)
+			fmt.Println(version.Version)
 			return
 		}
 	}
 
 	configPath := flag.String("config", "", "path to iron-proxy YAML config file")
-	bootstrapTokenFlag := flag.String("bootstrap-token", "", "bootstrap token for control plane registration")
+	tokenFlag := flag.String("token", "", "control plane bearer token (managed mode)")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -73,24 +75,23 @@ func main() {
 	}
 
 	// CLI flag takes precedence over environment variable.
-	bootstrapToken := *bootstrapTokenFlag
-	if bootstrapToken == "" {
-		bootstrapToken = os.Getenv("IRON_BOOTSTRAP_TOKEN")
+	proxyToken := *tokenFlag
+	if proxyToken == "" {
+		proxyToken = os.Getenv("IRON_PROXY_TOKEN")
 	}
 
-	// Managed mode is determined by the presence of a bootstrap token or
-	// an existing credential from a prior registration.
-	stateStore, err := stateStorePath()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	// Managed mode is determined by the presence of a control plane token.
+	managed := proxyToken != ""
+
+	// Standalone mode serves /v1/reload, which re-reads the config file.
+	// Managed mode serves /v1/status and /v1/sync instead: the control plane
+	// stays the source of truth for config, while the sandbox control plane
+	// can verify which principal's config the proxy has actually applied
+	// before routing traffic through it.
+	if cfg.Management.Listen != "" && !managed && *configPath == "" {
+		fmt.Fprintln(os.Stderr, "error: management.listen requires --config in standalone mode; /v1/reload has no file to re-read")
 		os.Exit(1)
 	}
-	cred, credErr := controlplane.LoadCredential(stateStore)
-	if credErr != nil && !errors.Is(credErr, os.ErrNotExist) {
-		logger.Error("loading credential", slog.String("error", credErr.Error()))
-		os.Exit(1)
-	}
-	managed := bootstrapToken != "" || cred != nil
 
 	// Both modes produce a pipeline holder. Managed mode populates the
 	// initial transforms from the control plane and starts a poller that
@@ -102,13 +103,28 @@ func main() {
 
 	// errc collects fatal errors from all background goroutines: servers
 	// and (in managed mode) the config poller.
-	errc := make(chan error, 4)
+	errc := make(chan error, 5)
+
+	// The postgres listener comes from the local YAML postgres: block
+	// (self-managed proxies, inline DSNs) and, in managed mode, has additional
+	// routes layered on from the control-plane sync payload. The manager is
+	// created up front so the config poller can hot-reload it.
+	localPgListener, err := postgres.LoadFromNode(cfg.Postgres, logger)
+	if err != nil {
+		logger.Error("loading postgres config", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	pgManager := postgres.NewManager(logger)
+	pgListener := localPgListener
+
 	var holder *transform.PipelineHolder
+	var mcpHolder *mcp.PolicyHolder
 	var otelCfg iotel.ExportConfig
+	var poller *controlplane.Poller
 
 	if managed {
 		var ingestToken string
-		holder, ingestToken = initManaged(ctx, cfg, bodyLimits, errc, stateStore, bootstrapToken, cred, logger)
+		holder, mcpHolder, ingestToken, pgListener, poller = initManaged(ctx, cfg, bodyLimits, errc, proxyToken, pgManager, localPgListener, logger)
 		if ingestToken != "" {
 			otelCfg.DefaultEndpoint = "https://ingest.iron.sh/v1/logs"
 			otelCfg.DefaultHeaders = map[string]string{
@@ -116,7 +132,7 @@ func main() {
 			}
 		}
 	} else {
-		holder = initStandalone(cfg, bodyLimits, logger)
+		holder, mcpHolder = initStandalone(cfg, bodyLimits, logger)
 	}
 
 	// 5. Validate the fully-assembled config.
@@ -167,8 +183,11 @@ func main() {
 		logger.Info("using upstream resolver", slog.String("addr", cfg.DNS.UpstreamResolver))
 	}
 
+	// Initialize DNS server unless disabled. When off, clients are expected to
+	// reach the proxy via explicit HTTP(S)_PROXY settings rather than DNS
+	// interception.
 	var dnsServer *idns.Server
-	if cfg.DNS.Listen != "" {
+	if cfg.DNS.IsEnabled() {
 		dnsServer, err = idns.New(cfg.DNS, resolver, logger)
 		if err != nil {
 			logger.Error("initializing DNS server", slog.String("error", err.Error()))
@@ -176,21 +195,62 @@ func main() {
 		}
 	}
 
+	// Build the upstream-dial deny guard. config.Validate has already
+	// confirmed the entries parse, so this should not fail.
+	guard, err := dnsguard.New(cfg.Proxy.UpstreamDenyCIDRs.Values)
+	if err != nil {
+		logger.Error("initializing upstream deny guard", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if len(cfg.Proxy.UpstreamDenyCIDRs.Values) > 0 {
+		logger.Info("upstream deny list active",
+			slog.Any("cidrs", cfg.Proxy.UpstreamDenyCIDRs.Values),
+		)
+	}
+
 	// Initialize proxy.
 	p := proxy.New(proxy.Options{
-		HTTPAddr:   cfg.Proxy.HTTPListen,
-		HTTPSAddr:  cfg.Proxy.HTTPSListen,
-		TunnelAddr: cfg.Proxy.TunnelListen,
-		TLSMode:    cfg.TLS.Mode,
-		CertCache:  certCache,
-		Pipeline:   holder,
-		Resolver:   resolver,
-		Logger:     logger,
+		HTTPAddr:                      cfg.Proxy.HTTPListen,
+		HTTPSAddr:                     cfg.Proxy.HTTPSListen,
+		TunnelAddr:                    cfg.Proxy.TunnelListen,
+		TLSMode:                       cfg.TLS.Mode,
+		CertCache:                     certCache,
+		Pipeline:                      holder,
+		Resolver:                      resolver,
+		Guard:                         guard,
+		MCPPolicy:                     mcpHolder,
+		Logger:                        logger,
+		UpstreamResponseHeaderTimeout: time.Duration(cfg.Proxy.UpstreamResponseHeaderTimeout),
+		UpstreamProxy:                 cfg.Proxy.UpstreamProxy.ProxyFunc(),
+		// Managed proxies fail closed until the first control-plane config
+		// has been applied; an un-synced pipeline would otherwise pass
+		// requests through with placeholder credentials intact.
+		Ready: managedReady(poller),
 	})
 
 	// Initialize metrics server.
 	metricsServer := metrics.New(cfg.Metrics.Listen, logger)
 
+	// Initialize management server: /v1/reload in standalone mode,
+	// /v1/status and /v1/sync in managed mode.
+	var mgmtServer *management.Server
+	if cfg.Management.Listen != "" {
+		mgmtOpts := management.Options{
+			Addr:   cfg.Management.Listen,
+			APIKey: os.Getenv(cfg.Management.APIKeyEnv),
+			Logger: logger,
+			Ctx:    ctx,
+		}
+		if managed {
+			mgmtOpts.Status = func() any { return poller.Status() }
+			mgmtOpts.SyncNow = poller.Poke
+		} else {
+			mgmtOpts.Reload = newReloadFunc(*configPath, holder, mcpHolder, pgManager, bodyLimits, logger)
+		}
+		mgmtServer = management.New(mgmtOpts)
+	}
+
+	// Start services.
 	if dnsServer != nil {
 		go func() { errc <- fmt.Errorf("dns: %w", dnsServer.ListenAndServe()) }()
 	}
@@ -198,9 +258,17 @@ func main() {
 	if cfg.Metrics.Listen != "" {
 		go func() { errc <- fmt.Errorf("metrics: %w", metricsServer.ListenAndServe()) }()
 	}
+	if mgmtServer != nil {
+		go func() { errc <- fmt.Errorf("management: %w", mgmtServer.ListenAndServe()) }()
+	}
+	pgManager.Start(pgListener, errc)
 
+	dnsListen := "disabled"
+	if cfg.DNS.IsEnabled() {
+		dnsListen = cfg.DNS.Listen
+	}
 	startAttrs := []any{
-		slog.String("dns_listen", cfg.DNS.Listen),
+		slog.String("dns_listen", dnsListen),
 		slog.String("http_listen", cfg.Proxy.HTTPListen),
 		slog.String("https_listen", cfg.Proxy.HTTPSListen),
 		slog.String("metrics_listen", cfg.Metrics.Listen),
@@ -248,56 +316,38 @@ func main() {
 			logger.Error("metrics server shutdown error", slog.String("error", err.Error()))
 		}
 	}
+	if mgmtServer != nil {
+		if err := mgmtServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("management server shutdown error", slog.String("error", err.Error()))
+		}
+	}
+	if err := pgManager.Shutdown(shutdownCtx); err != nil {
+		logger.Error("postgres server shutdown error", slog.String("error", err.Error()))
+	}
 
 	logger.Info("iron-proxy stopped")
 }
 
 // initManaged registers with the control plane, performs an initial sync, builds
-// the initial pipeline, and starts the config poller. The poller runs until ctx
-// is canceled and sends fatal errors on errc. Returns the pipeline holder and
-// the ingest token from the initial sync (empty if the sync failed).
-func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.BodyLimits, errc chan<- error, stateStore, bootstrapToken string, cred *controlplane.Credential, logger *slog.Logger) (*transform.PipelineHolder, string) {
+// the initial pipeline and MCP policy, and starts the config poller. The poller
+// runs until ctx is canceled and sends fatal errors on errc. Returns the
+// pipeline holder, the MCP policy holder, and the ingest token from the initial
+// sync (empty if the sync failed).
+//
+// Initial MCP policy preference: control-plane-supplied mcp block first, then
+// fall back to cfg.MCP from the YAML if the sync did not include one.
+func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.BodyLimits, errc chan<- error, proxyToken string, pgManager *postgres.Manager, localPgListener *postgres.Listener, logger *slog.Logger) (*transform.PipelineHolder, *mcp.PolicyHolder, string, *postgres.Listener, *controlplane.Poller) {
 	cpURL := envOrDefault("IRON_CONTROL_PLANE_URL", "https://api.iron.sh")
-	tags := cfg.Tags
 	logger.Info("starting in managed mode", slog.String("control_plane_url", cpURL))
 
-	client := controlplane.NewClient(cpURL, logger)
-
-	// Register if we don't have a credential yet.
-	if cred == nil {
-		logger.Info("registering with control plane")
-		var regErr error
-		cred, regErr = client.Register(ctx, bootstrapToken, controlplane.RegisterMetadata{
-			Tags:    tags,
-			Version: version,
-		})
-		if regErr != nil {
-			logger.Error("registration failed", slog.String("error", regErr.Error()))
-			os.Exit(1)
-		}
-		logger.Info("registered successfully", slog.String("proxy_id", cred.ProxyID))
-
-		if err := ensureStateStoreDir(stateStore); err != nil {
-			logger.Error("creating state store directory", slog.String("error", err.Error()))
-			os.Exit(1)
-		}
-		if err := controlplane.SaveCredential(stateStore, cred); err != nil {
-			logger.Error("saving credential", slog.String("error", err.Error()))
-			os.Exit(1)
-		}
-	} else {
-		logger.Info("loaded existing credential", slog.String("proxy_id", cred.ProxyID))
-	}
-
-	client.SetCredential(cred)
+	client := controlplane.NewClient(cpURL, proxyToken, logger)
 
 	// Initial sync.
 	syncResp, err := client.Sync(ctx, "")
 	if err != nil {
 		var apiErr *controlplane.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == controlplane.ErrProxyRevoked {
-			logger.Error("proxy has been revoked, deleting credential and exiting")
-			_ = controlplane.DeleteCredential(stateStore)
+			logger.Error("proxy has been revoked, exiting")
 			os.Exit(1)
 		}
 		logger.Warn("initial sync failed, will retry in background", slog.String("error", err.Error()))
@@ -305,12 +355,16 @@ func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.B
 
 	configHash := ""
 	ingestToken := ""
-	var initialRules json.RawMessage
+	var initialRules, initialSecrets, initialTransformsRaw, initialMCP, initialPostgres json.RawMessage
 	if syncResp != nil {
 		configHash = syncResp.ConfigHash
 		initialRules = syncResp.Rules
+		initialSecrets = syncResp.Secrets
+		initialTransformsRaw = syncResp.Transforms
+		initialMCP = syncResp.MCP
+		initialPostgres = syncResp.Postgres
 		ingestToken = syncResp.IngestToken
-		if len(syncResp.Rules) > 0 {
+		if len(syncResp.Rules) > 0 || len(syncResp.Secrets) > 0 || len(syncResp.Transforms) > 0 || len(syncResp.MCP) > 0 {
 			logger.Info("received initial config from control plane",
 				slog.String("config_hash", syncResp.ConfigHash),
 			)
@@ -318,7 +372,7 @@ func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.B
 	}
 
 	// Build initial pipeline from sync response.
-	initialTransforms, err := config.TransformsFromSync(initialRules)
+	initialTransforms, err := config.TransformsFromSync(initialRules, initialSecrets, initialTransformsRaw)
 	if err != nil {
 		logger.Error("parsing initial config", slog.String("error", err.Error()))
 		os.Exit(1)
@@ -331,58 +385,289 @@ func initManaged(ctx context.Context, cfg *config.Config, bodyLimits transform.B
 	}
 	holder := transform.NewPipelineHolder(pipeline)
 
+	// Build initial MCP policy: prefer the control-plane-supplied block; fall
+	// back to cfg.MCP from the YAML so an operator can ship a default that
+	// applies until the first sync arrives.
+	mcpHolder, err := buildInitialMCPHolder(cfg, initialMCP, logger)
+	if err != nil {
+		logger.Error("building initial mcp policy", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// Compute the initial postgres listener: the local YAML listener with any
+	// control-plane-synced routes layered on when its env vars are present. If
+	// the initial sync carried no postgres block (or an invalid one), fall back
+	// to the local listener.
+	pgListener := localPgListener
+	if listener, ok := postgresListenerFromSync(localPgListener, os.Getenv, logger, initialPostgres); ok {
+		pgListener = listener
+	}
+
 	// Start config poller.
-	poller := controlplane.NewPoller(client, configHash, func(rules json.RawMessage, secrets json.RawMessage) error {
-		newTransforms, err := config.TransformsFromSync(rules)
-		if err != nil {
-			return fmt.Errorf("parsing config update: %w", err)
+	poller := controlplane.NewPollerWithInterval(client, configHash, func(u controlplane.SyncUpdate) error {
+		if u.Rules != nil || u.Secrets != nil || u.Transforms != nil {
+			if err := applyPipelineSync(holder, bodyLimits, logger, u.Rules, u.Secrets, u.Transforms); err != nil {
+				return err
+			}
 		}
-		newPipeline, err := buildPipeline(newTransforms, bodyLimits, logger)
-		if err != nil {
-			return fmt.Errorf("building updated pipeline: %w", err)
+		if u.MCP != nil {
+			if err := applyMCPSync(mcpHolder, logger, u.MCP); err != nil {
+				return err
+			}
 		}
-		newPipeline.SetAuditFunc(holder.Load().AuditFunc())
-		holder.Store(newPipeline)
-		logger.Info("pipeline reloaded", slog.String("transforms", newPipeline.Names()))
+		if u.Postgres != nil {
+			if err := applyPostgresSync(ctx, pgManager, localPgListener, os.Getenv, logger, u.Postgres); err != nil {
+				return err
+			}
+		}
 		return nil
-	}, logger)
+	}, logger, time.Duration(cfg.ControlPlane.PollInterval))
+
+	// Seed the poller's status from the startup sync so /v1/status (and the
+	// fail-closed gate) reflect it before the polling loop's first pass.
+	poller.SeedStatus(syncResp)
 
 	go func() {
 		errc <- poller.Run(ctx)
 	}()
 
-	return holder, ingestToken
+	return holder, mcpHolder, ingestToken, pgListener, poller
 }
 
-// initStandalone builds the pipeline from the YAML config's transforms.
-func initStandalone(cfg *config.Config, bodyLimits transform.BodyLimits, logger *slog.Logger) *transform.PipelineHolder {
+// managedReady gates the proxy on the first applied control-plane config.
+// A nil poller (standalone mode) means always ready.
+func managedReady(poller *controlplane.Poller) func() bool {
+	if poller == nil {
+		return nil
+	}
+	return func() bool { return poller.Status().SyncedOnce }
+}
+
+// buildInitialMCPHolder picks the initial MCP policy source: a control-plane
+// MCP block when present, otherwise the YAML cfg.MCP fallback. A nil holder
+// means "no policy configured"; the proxy treats it as MCP disabled.
+func buildInitialMCPHolder(cfg *config.Config, initialMCP json.RawMessage, logger *slog.Logger) (*mcp.PolicyHolder, error) {
+	node, present, err := config.MCPFromSync(initialMCP)
+	if err != nil {
+		return nil, err
+	}
+	if !present {
+		node = cfg.MCP
+	}
+	policy, err := mcp.LoadFromNode(node)
+	if err != nil {
+		return nil, err
+	}
+	if policy != nil {
+		logger.Info("mcp policy enabled")
+	}
+	return mcp.NewPolicyHolder(policy), nil
+}
+
+// initStandalone builds the pipeline and MCP policy from the YAML config.
+func initStandalone(cfg *config.Config, bodyLimits transform.BodyLimits, logger *slog.Logger) (*transform.PipelineHolder, *mcp.PolicyHolder) {
 	pipeline, err := buildPipeline(cfg.Transforms, bodyLimits, logger)
 	if err != nil {
 		logger.Error("building transform pipeline", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	return transform.NewPipelineHolder(pipeline)
-}
-
-// stateStorePath returns the state store path without creating any directories.
-// It honors IRON_STATE_STORE and falls back to the XDG config directory.
-func stateStorePath() (string, error) {
-	if v := os.Getenv("IRON_STATE_STORE"); v != "" {
-		return v, nil
-	}
-	configDir, err := os.UserConfigDir()
+	mcpPolicy, err := mcp.LoadFromNode(cfg.MCP)
 	if err != nil {
-		return "", fmt.Errorf("determining config directory: %w", err)
+		logger.Error("loading mcp policy", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
-	return filepath.Join(configDir, "iron-proxy", "state"), nil
+	if mcpPolicy != nil {
+		logger.Info("mcp policy enabled")
+	}
+	return transform.NewPipelineHolder(pipeline), mcp.NewPolicyHolder(mcpPolicy)
 }
 
-// ensureStateStoreDir creates the parent directory for the state store path.
-func ensureStateStoreDir(stateStore string) error {
-	if err := os.MkdirAll(filepath.Dir(stateStore), 0o700); err != nil {
-		return fmt.Errorf("creating state store directory: %w", err)
+// applyPipelineSync builds a new pipeline from a sync payload and atomically
+// swaps it in. If parsing or pipeline construction fails, the existing pipeline
+// is preserved and an error is logged: an invalid push from the control plane
+// must not take down the proxy.
+func applyPipelineSync(holder *transform.PipelineHolder, bodyLimits transform.BodyLimits, logger *slog.Logger, rules, secrets, transforms json.RawMessage) error {
+	newTransforms, err := config.TransformsFromSync(rules, secrets, transforms)
+	if err != nil {
+		logger.Error("rejecting invalid pipeline config from sync, keeping current pipeline", slog.String("error", err.Error()))
+		return fmt.Errorf("pipeline sync: %w", err)
+	}
+	newPipeline, err := buildPipeline(newTransforms, bodyLimits, logger)
+	if err != nil {
+		logger.Error("rejecting invalid pipeline config from sync, keeping current pipeline", slog.String("error", err.Error()))
+		return fmt.Errorf("pipeline sync: %w", err)
+	}
+	newPipeline.SetAuditFunc(holder.Load().AuditFunc())
+	holder.Store(newPipeline)
+	logger.Info("pipeline reloaded", slog.String("transforms", newPipeline.Names()))
+	return nil
+}
+
+// applyMCPSync compiles a new MCP policy from a sync payload and atomically
+// swaps it in. Parse or compile errors are logged and the prior policy is
+// preserved: an invalid push from the control plane must not take down a
+// running proxy. An empty/null mcp block is interpreted by the caller as
+// "no update" and is not delivered here.
+func applyMCPSync(holder *mcp.PolicyHolder, logger *slog.Logger, raw json.RawMessage) error {
+	node, present, err := config.MCPFromSync(raw)
+	if err != nil {
+		logger.Error("rejecting invalid mcp policy from sync, keeping current policy", slog.String("error", err.Error()))
+		return fmt.Errorf("mcp sync: %w", err)
+	}
+	if !present {
+		// Should not happen — caller filters absent/null — but treat as no-op.
+		return nil
+	}
+	policy, err := mcp.LoadFromNode(node)
+	if err != nil {
+		logger.Error("rejecting invalid mcp policy from sync, keeping current policy", slog.String("error", err.Error()))
+		return fmt.Errorf("mcp sync: %w", err)
+	}
+	holder.Store(policy)
+	if policy == nil {
+		logger.Info("mcp policy cleared by control plane")
+	} else {
+		logger.Info("mcp policy reloaded")
 	}
 	return nil
+}
+
+// Environment variables that configure the managed postgres listener when the
+// proxy has no local YAML postgres block to source these from. They configure
+// the single listener, not individual upstreams.
+const (
+	pgListenEnv         = "IRON_PROXY_PG_LISTEN"
+	pgClientUserEnv     = "IRON_PROXY_PG_CLIENT_USER"
+	pgClientPasswordEnv = "IRON_PROXY_PG_CLIENT_PASSWORD"
+)
+
+// postgresListenerFromSync builds the single postgres listener for managed mode.
+// Each synced entry becomes an upstream keyed by its database, carrying the
+// database, DSN, and role the control plane delivered.
+//
+// When a local YAML postgres block is present, the synced upstreams are layered
+// onto it, reusing its bind address and client credential; a synced upstream
+// whose database collides with a local one is dropped (logged). Otherwise the
+// listener is built from the environment: IRON_PROXY_PG_LISTEN plus the shared
+// IRON_PROXY_PG_CLIENT_USER / IRON_PROXY_PG_CLIENT_PASSWORD. When no bind address
+// or client credential is available, or no upstreams resolve, no listener is
+// returned. Returns ok=false only when the sync payload itself is invalid,
+// signaling the caller to keep the current listener.
+func postgresListenerFromSync(local *postgres.Listener, getenv func(string) string, logger *slog.Logger, raw json.RawMessage) (*postgres.Listener, bool) {
+	entries, err := config.PostgresFromSync(raw, logger)
+	if err != nil {
+		logger.Error("rejecting invalid postgres config from sync, keeping current listener", slog.String("error", err.Error()))
+		return nil, false
+	}
+
+	synced := make([]*postgres.Upstream, 0, len(entries))
+	seen := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		u, err := postgres.NewManagedUpstream(e.Database, e.DSN, e.Role, e.Settings)
+		if err != nil {
+			logger.Error("skipping synced postgres upstream: invalid upstream",
+				slog.String("foreign_id", e.ForeignID),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		if seen[u.Database()] {
+			logger.Warn("skipping synced postgres upstream: duplicate database",
+				slog.String("foreign_id", e.ForeignID),
+				slog.String("database", u.Database()),
+			)
+			continue
+		}
+		seen[u.Database()] = true
+		synced = append(synced, u)
+	}
+
+	// With a local listener, layer the synced upstreams on top, reusing its
+	// address and client credential. Local wins on a database collision.
+	if local != nil {
+		merged, dropped := local.WithUpstreams(synced)
+		for _, db := range dropped {
+			logger.Warn("skipping synced postgres upstream: duplicate database",
+				slog.String("database", db))
+		}
+		return merged, true
+	}
+
+	// No local listener: source the listener knobs from the environment.
+	if len(synced) == 0 {
+		return nil, true
+	}
+	listen := getenv(pgListenEnv)
+	clientUser := getenv(pgClientUserEnv)
+	clientPassword := getenv(pgClientPasswordEnv)
+	if listen == "" || clientUser == "" || clientPassword == "" {
+		logger.Info("skipping control-plane postgres upstreams: listener env not fully set",
+			slog.Bool("has_listen", listen != ""),
+			slog.Bool("has_client_user", clientUser != ""),
+			slog.Bool("has_client_password", clientPassword != ""),
+			slog.Int("upstream_count", len(synced)),
+		)
+		return nil, true
+	}
+
+	listener, err := postgres.NewListener(listen, clientUser, clientPassword, synced)
+	if err != nil {
+		logger.Error("skipping postgres listener: invalid listener", slog.String("error", err.Error()))
+		return nil, true
+	}
+	return listener, true
+}
+
+// applyPostgresSync rebuilds the postgres listener from a sync payload and
+// hot-reloads the manager. An invalid payload is logged and the running
+// listener is preserved.
+func applyPostgresSync(ctx context.Context, mgr *postgres.Manager, local *postgres.Listener, getenv func(string) string, logger *slog.Logger, raw json.RawMessage) error {
+	listener, ok := postgresListenerFromSync(local, getenv, logger, raw)
+	if !ok {
+		return fmt.Errorf("postgres sync: invalid postgres config")
+	}
+	mgr.Reload(ctx, listener)
+	logger.Info("postgres listener reloaded from sync", slog.Bool("running", listener != nil))
+	return nil
+}
+
+// newReloadFunc returns a management.ReloadFunc that re-reads the YAML config
+// from configPath, rebuilds the pipeline, MCP policy, and postgres listeners,
+// and atomically swaps them in. Parse, validation, and build errors are
+// wrapped in *management.ValidationError so the management server returns
+// 422 and the existing state is left untouched. Validation runs for every
+// component before any state is mutated.
+func newReloadFunc(configPath string, holder *transform.PipelineHolder, mcpHolder *mcp.PolicyHolder, pgManager *postgres.Manager, bodyLimits transform.BodyLimits, logger *slog.Logger) management.ReloadFunc {
+	return func(ctx context.Context) error {
+		newCfg, err := config.LoadConfig(configPath)
+		if err != nil {
+			return &management.ValidationError{Err: err}
+		}
+		if err := config.Validate(newCfg); err != nil {
+			return &management.ValidationError{Err: err}
+		}
+		newPipeline, err := buildPipeline(newCfg.Transforms, bodyLimits, logger)
+		if err != nil {
+			return &management.ValidationError{Err: err}
+		}
+		newPolicy, err := mcp.LoadFromNode(newCfg.MCP)
+		if err != nil {
+			return &management.ValidationError{Err: err}
+		}
+		newPgListener, err := postgres.LoadFromNode(newCfg.Postgres, logger)
+		if err != nil {
+			return &management.ValidationError{Err: err}
+		}
+		newPipeline.SetAuditFunc(holder.Load().AuditFunc())
+		holder.Store(newPipeline)
+		mcpHolder.Store(newPolicy)
+		pgManager.Reload(ctx, newPgListener)
+		logger.Info("pipeline reloaded via management API",
+			slog.String("transforms", newPipeline.Names()),
+			slog.Bool("postgres_listener", newPgListener != nil),
+		)
+		return nil
+	}
 }
 
 // buildPipeline creates a transform.Pipeline from config transforms.

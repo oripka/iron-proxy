@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,8 @@ import (
 
 	"github.com/ironsh/iron-proxy/internal/certcache"
 	"github.com/ironsh/iron-proxy/internal/config"
+	"github.com/ironsh/iron-proxy/internal/dnsguard"
+	"github.com/ironsh/iron-proxy/internal/mcp"
 	"github.com/ironsh/iron-proxy/internal/transform"
 )
 
@@ -40,6 +43,8 @@ type Proxy struct {
 	pipeline       *transform.PipelineHolder
 	transport      *http.Transport
 	resolver       *net.Resolver
+	guard          *dnsguard.Guard
+	mcpPolicy      *mcp.PolicyHolder
 	logger         *slog.Logger
 
 	// shutdownCtx is canceled by Shutdown to unblock in-flight TCP-passthrough
@@ -51,7 +56,10 @@ type Proxy struct {
 	// 443 in production so a client-supplied CONNECT port cannot pivot an
 	// allowlisted hostname onto a different port. Overridable in tests.
 	sniUpstreamPort string
+	ready           func() bool
 }
+
+const notReadyMessage = "proxy is not ready: awaiting control-plane config"
 
 // Options configures Proxy construction.
 type Options struct {
@@ -62,7 +70,23 @@ type Options struct {
 	CertCache  *certcache.Cache // required when TLSMode == config.TLSModeMITM
 	Pipeline   *transform.PipelineHolder
 	Resolver   *net.Resolver
+	Guard      *dnsguard.Guard   // nil is treated as an empty (no-op) guard
+	MCPPolicy  *mcp.PolicyHolder // optional MCP-aware policy interceptor; nil disables MCP handling
 	Logger     *slog.Logger
+	// UpstreamResponseHeaderTimeout overrides the upstream HTTP transport's
+	// ResponseHeaderTimeout. Zero falls back to
+	// config.DefaultUpstreamResponseHeaderTimeout.
+	UpstreamResponseHeaderTimeout time.Duration
+	// UpstreamProxy, when non-nil, routes upstream HTTP/HTTPS requests through
+	// an upstream SOCKS5/HTTP CONNECT proxy (see http.Transport.Proxy). nil
+	// means connect directly. Use config.UpstreamProxy.ProxyFunc to build one.
+	UpstreamProxy func(*http.Request) (*url.URL, error)
+	// Ready, when non-nil, gates request handling: while it returns false
+	// every proxied request is rejected with 503. Managed proxies use it to
+	// fail closed until the first control-plane config has been applied, so
+	// requests can never pass through un-transformed (leaking placeholder
+	// credentials upstream) during startup.
+	Ready func() bool
 }
 
 // New creates a new Proxy. In TLSModeMITM, certCache must be non-nil. In
@@ -72,15 +96,22 @@ func New(opts Options) *Proxy {
 		opts.TLSMode = config.TLSModeMITM
 	}
 	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	guard := opts.Guard
+	if guard == nil {
+		guard, _ = dnsguard.New(nil)
+	}
 	p := &Proxy{
+		ready:          opts.Ready,
 		httpsAddr:      opts.HTTPSAddr,
 		tlsMode:        opts.TLSMode,
 		tunnelAddr:     opts.TunnelAddr,
 		tunnelDone:     make(chan struct{}),
 		certCache:      opts.CertCache,
 		pipeline:       opts.Pipeline,
-		transport:      buildTransport(opts.Resolver),
+		transport:      buildTransport(opts.Resolver, guard, opts.UpstreamResponseHeaderTimeout, opts.UpstreamProxy),
 		resolver:       opts.Resolver,
+		guard:          guard,
+		mcpPolicy:      opts.MCPPolicy,
 		logger:         opts.Logger,
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
@@ -88,12 +119,12 @@ func New(opts Options) *Proxy {
 
 	p.httpServer = &http.Server{
 		Addr:    opts.HTTPAddr,
-		Handler: http.HandlerFunc(p.handleHTTP),
+		Handler: http.HandlerFunc(p.handleDirectHTTP),
 	}
 
 	p.httpsServer = &http.Server{
 		Addr:    opts.HTTPSAddr,
-		Handler: http.HandlerFunc(p.handleHTTP),
+		Handler: http.HandlerFunc(p.handleDirectHTTP),
 		TLSConfig: &tls.Config{
 			GetCertificate: p.getCertificate,
 		},
@@ -240,12 +271,42 @@ func (p *Proxy) beginPipelineRun(result *transform.PipelineResult) (*transform.P
 	}
 }
 
-func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) handleDirectHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
 		p.handleConnect(w, r)
 		return
 	}
+	p.handleHTTP(w, r, nil)
+}
 
+func (p *Proxy) isReady() bool {
+	return p.ready == nil || p.ready()
+}
+
+func markNotReady(result *transform.PipelineResult) {
+	result.Action = transform.ActionReject
+	result.StatusCode = http.StatusServiceUnavailable
+	result.RequestTransforms = append(result.RequestTransforms, transform.TransformTrace{
+		Name:   "ready",
+		Action: transform.ActionReject,
+		Annotations: map[string]any{
+			"reason": "awaiting_control_plane_config",
+		},
+	})
+}
+
+func notReadyResponse() *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusServiceUnavailable,
+		Status:     "503 " + http.StatusText(http.StatusServiceUnavailable),
+		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+		Body:       io.NopCloser(strings.NewReader(notReadyMessage + "\n")),
+	}
+}
+
+// handleHTTP is the core HTTP request handler. tunnelInfo is non-nil only
+// when r originated inside a CONNECT/SOCKS5 tunnel.
+func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *transform.TunnelInfo) {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
@@ -254,6 +315,15 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	host := targetHost(r)
 	if host == "" {
 		http.Error(w, "missing Host header", http.StatusBadRequest)
+		return
+	}
+
+	// Reject paths with "." or ".." segments. Policy rules (allowlist,
+	// secrets, etc.) match against the raw request path, but an upstream
+	// may canonicalize "/public/../admin" to "/admin" and serve a resource
+	// the rule was meant to protect. Rejecting up front avoids the gap.
+	if containsDotSegments(r.URL.Path) {
+		http.Error(w, "path contains dot segments", http.StatusBadRequest)
 		return
 	}
 
@@ -273,10 +343,12 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Build transform context and audit state
+	// Clone tunnelInfo so a transform that mutates the annotations map can't
+	// leak state into sibling requests that share the same tunnel.
 	tctx := &transform.TransformContext{
 		Logger: p.logger,
 		Mode:   transform.ModeMITM,
+		Tunnel: cloneTunnelInfo(tunnelInfo),
 	}
 	if r.TLS != nil {
 		tctx.SNI = r.TLS.ServerName
@@ -289,26 +361,74 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		RemoteAddr: r.RemoteAddr,
 		SNI:        tctx.SNI,
 		Mode:       transform.ModeMITM,
+		Tunnel:     tctx.Tunnel,
 	}
 	pl, finish := p.beginPipelineRun(result)
 	defer finish()
+
+	if !p.isReady() {
+		markNotReady(result)
+		http.Error(w, notReadyMessage, http.StatusServiceUnavailable)
+		return
+	}
 
 	bodyLimits := pl.BodyLimits()
 	// Wrap request body for lazy buffering by transforms.
 	r.Body = transform.NewBufferedBody(r.Body, bodyLimits.MaxRequestBodyBytes)
 
 	// Run request transforms
-	if rejectResp, err := pl.ProcessRequest(r.Context(), tctx, r, &result.RequestTransforms); err != nil {
+	rejectResp, err := pl.ProcessRequest(r.Context(), tctx, r, &result.RequestTransforms)
+	// Copy any captured request body from the body_capture transform's side
+	// channel onto the PipelineResult so the audit emitters can render it as
+	// a top-level field. Done unconditionally so reject + error paths still
+	// preserve the captured body (matches MCP's behavior at line ~333 below).
+	result.BodyCapture = tctx.BodyCapture
+	if err != nil {
+		if markIfClientCancel(r, err, result) {
+			return
+		}
 		result.Action = transform.ActionContinue // error, not reject
 		result.StatusCode = http.StatusBadGateway
 		result.Err = err
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 		return
-	} else if rejectResp != nil {
-		result.Action = transform.ActionReject
+	}
+	if rejectResp != nil {
+		result.Action = transform.ShortCircuitAction(result.RequestTransforms)
 		result.StatusCode = rejectResp.StatusCode
 		p.writeResponse(w, rejectResp)
 		return
+	}
+
+	// MCP policy: evaluate the request against any matching MCP server. Runs
+	// after the transform pipeline so allowlist/secrets have already applied.
+	// Snapshot once per request so a hot-swap mid-request stays consistent.
+	mcpPolicy := p.mcpPolicy.Load()
+	var mcpServer *mcp.Server
+	var mcpTrace *mcp.Trace
+	if mcpPolicy != nil {
+		if s := mcpPolicy.MatchServer(r); s != nil {
+			mcpServer = s
+			mcpTrace = &mcp.Trace{Server: s.Name}
+			result.MCP = mcpTrace
+			rejectResp, err := mcpPolicy.EvaluateRequest(s, r, mcpTrace)
+			if err != nil {
+				if markIfClientCancel(r, err, result) {
+					return
+				}
+				result.Action = transform.ActionContinue
+				result.StatusCode = http.StatusBadGateway
+				result.Err = err
+				http.Error(w, "bad gateway", http.StatusBadGateway)
+				return
+			}
+			if rejectResp != nil {
+				result.Action = transform.ActionReject
+				result.StatusCode = rejectResp.StatusCode
+				p.writeResponse(w, rejectResp)
+				return
+			}
+		}
 	}
 
 	// WebSocket upgrade: hijack and proxy bidirectionally
@@ -320,12 +440,17 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build upstream request. Use r.URL (which transforms may have modified)
-	// rather than r.RequestURI (which is immutable).
-	path := r.URL.Path
-	if r.URL.RawQuery != "" {
-		path = path + "?" + r.URL.RawQuery
-	}
-	upstreamURL := fmt.Sprintf("%s://%s%s", scheme, host, path)
+	// rather than r.RequestURI (which is immutable). Preserve RawPath so
+	// percent-encoded reserved characters like %2F survive to the upstream —
+	// some APIs (e.g. GCS object names) treat decoded vs encoded slashes as
+	// distinct path segments.
+	upstreamURL := (&url.URL{
+		Scheme:   scheme,
+		Host:     host,
+		Path:     r.URL.Path,
+		RawPath:  r.URL.RawPath,
+		RawQuery: r.URL.RawQuery,
+	}).String()
 
 	reqBody := transform.RequireBufferedBody(r.Body)
 	// Check Len() before StreamingReader(), which clears the original reader.
@@ -339,6 +464,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	copyHeaders(upstreamReq.Header, r.Header)
+	sanitizeUpstreamHeaders(upstreamReq.Header)
 	// If a transform buffered the request body, set ContentLength so the
 	// upstream receives a Content-Length header instead of chunked encoding.
 	// Otherwise, preserve the original Content-Length from the client.
@@ -350,6 +476,9 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.doUpstream(upstreamReq)
 	if err != nil {
+		if markIfClientCancel(r, err, result) {
+			return
+		}
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway
 		result.Err = err
@@ -364,6 +493,9 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// Run response transforms
 	finalResp, err := pl.ProcessResponse(r.Context(), tctx, r, resp, &result.ResponseTransforms)
 	if err != nil {
+		if markIfClientCancel(r, err, result) {
+			return
+		}
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway
 		result.Err = err
@@ -371,8 +503,22 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result.Action = transform.ActionContinue
+	result.Action = transform.ShortCircuitAction(result.ResponseTransforms)
 	result.StatusCode = finalResp.StatusCode
+
+	// MCP response wrapping: filter tools/list payloads and other JSON-RPC
+	// messages on streams from a matched MCP server. WrapResponseBody
+	// returns a *transform.BufferedBody (or the original body untouched)
+	// so the proxy's streamSSE/writeResponse paths can consume it directly.
+	if mcpServer != nil && mcpPolicy != nil {
+		ct := finalResp.Header.Get("Content-Type")
+		wrapped, err := mcpPolicy.WrapResponseBody(mcpServer, ct, finalResp.Body, mcpTrace)
+		if err != nil {
+			p.logger.Warn("mcp response wrap error", slog.String("error", err.Error()))
+		} else if wrapped != nil {
+			finalResp.Body = wrapped
+		}
+	}
 
 	// SSE: stream with flushing
 	if isSSE(finalResp) {
@@ -393,6 +539,29 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	hostOnly := host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		hostOnly = h
+	}
+	target := host
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		target = net.JoinHostPort(target, "443")
+	}
+
+	ok, rejectResp, tunnelInfo := p.tunnelTransformCheck(r.RemoteAddr, target, r.Header)
+	if !ok {
+		if rejectResp == nil {
+			http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+			return
+		}
+		copyHeaders(w.Header(), rejectResp.Header)
+		status := rejectResp.StatusCode
+		if status == 0 {
+			status = http.StatusForbidden
+		}
+		w.WriteHeader(status)
+		if rejectResp.Body != nil {
+			defer rejectResp.Body.Close()
+			_, _ = io.Copy(w, rejectResp.Body)
+		}
+		return
 	}
 
 	hj, ok := w.(http.Hijacker)
@@ -448,7 +617,9 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	server := &http.Server{
-		Handler:           http.HandlerFunc(p.handleHTTP),
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			p.handleHTTP(w, r, tunnelInfo)
+		}),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
 
@@ -464,10 +635,70 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// isWebSocketUpgrade detects a WebSocket upgrade request.
+// isWebSocketUpgrade detects a WebSocket upgrade request. Connection is
+// parsed as comma-separated tokens with an exact case-insensitive "upgrade"
+// match so a value like "notupgrade" does not satisfy the check.
 func isWebSocketUpgrade(r *http.Request) bool {
 	return strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
-		strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade")
+		headerHasToken(r.Header, "Connection", "upgrade")
+}
+
+// headerHasToken reports whether the named header contains an exact
+// case-insensitive token (per RFC 7230 §3.2.6 comma-separated values).
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, v := range h.Values(name) {
+		for _, t := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(t), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hopByHopHeaders are the headers consumed at the connection boundary per
+// RFC 7230 §6.1, plus Proxy-Connection (a common non-standard variant).
+// These must not be forwarded to the upstream.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// sanitizeUpstreamHeaders removes hop-by-hop headers and any header named
+// by the client's Connection header before the request is forwarded
+// upstream. Modeled after net/http/httputil.ReverseProxy.
+func sanitizeUpstreamHeaders(h http.Header) {
+	// Collect Connection-named tokens before deleting Connection itself.
+	var connectionTokens []string
+	for _, v := range h.Values("Connection") {
+		for _, t := range strings.Split(v, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				connectionTokens = append(connectionTokens, t)
+			}
+		}
+	}
+
+	// Preserve TE: trailers for gRPC-over-HTTP/1.1 compatibility, matching
+	// net/http/httputil.ReverseProxy.
+	keepTrailers := headerHasToken(h, "Te", "trailers")
+
+	for _, name := range hopByHopHeaders {
+		h.Del(name)
+	}
+	for _, name := range connectionTokens {
+		h.Del(name)
+	}
+	if keepTrailers {
+		h.Set("Te", "trailers")
+	}
 }
 
 // handleWebSocket hijacks the client connection and proxies raw bytes
@@ -491,14 +722,19 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 		}
 	}
 
+	dialer := &net.Dialer{
+		Timeout:  30 * time.Second,
+		Resolver: p.resolver,
+		Control:  p.guard.DialControl,
+	}
 	if upstreamScheme == "wss" {
 		upstreamConn, err = tls.DialWithDialer(
-			&net.Dialer{Timeout: 30 * time.Second},
+			dialer,
 			"tcp", upstreamHost,
 			&tls.Config{MinVersion: tls.VersionTLS12},
 		)
 	} else {
-		upstreamConn, err = net.DialTimeout("tcp", upstreamHost, 30*time.Second)
+		upstreamConn, err = dialer.DialContext(r.Context(), "tcp", upstreamHost)
 	}
 	if err != nil {
 		p.logger.Error("websocket upstream dial failed",
@@ -509,7 +745,15 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 		return
 	}
 
-	// Write the original HTTP upgrade request to upstream
+	// Sanitize the inbound request headers before serializing the upgrade
+	// upstream so client-supplied Proxy-Authorization, hop-by-hop headers,
+	// and Connection-named tokens are not leaked. Re-set the upgrade
+	// headers explicitly with the proxy's own values.
+	sanitizeUpstreamHeaders(r.Header)
+	r.Header.Set("Connection", "Upgrade")
+	r.Header.Set("Upgrade", "websocket")
+
+	// Write the rewritten HTTP upgrade request to upstream
 	if writeErr := r.Write(upstreamConn); writeErr != nil {
 		p.logger.Error("websocket upstream write failed", slog.String("error", writeErr.Error()))
 		upstreamConn.Close()
@@ -633,27 +877,62 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
 // buildTransport creates the HTTP transport used for upstream requests.
 // If resolver is non-nil, the transport's dialer uses it instead of the OS
 // default — this prevents resolution loops when iron-proxy owns the system DNS.
-func buildTransport(resolver *net.Resolver) *http.Transport {
+// guard's DialControl is wired in so a hostname that resolves to a denied IP
+// is rejected before the TCP connect.
+// responseHeaderTimeout overrides the default 30-second
+// ResponseHeaderTimeout when greater than zero; pass 0 to keep the default.
+// proxyFunc, when non-nil, routes upstream requests through an upstream
+// SOCKS5/HTTP CONNECT proxy; the dialer (and thus guard.DialControl) then
+// applies to the proxy connection rather than the final target.
+func buildTransport(resolver *net.Resolver, guard *dnsguard.Guard, responseHeaderTimeout time.Duration, proxyFunc func(*http.Request) (*url.URL, error)) *http.Transport {
 	dialer := &net.Dialer{
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 		Resolver:  resolver,
+		Control:   guard.DialControl,
+	}
+	if responseHeaderTimeout <= 0 {
+		responseHeaderTimeout = config.DefaultUpstreamResponseHeaderTimeout
 	}
 	return &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		},
+		Proxy:                 proxyFunc,
 		DialContext:           dialer.DialContext,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 }
 
 func (p *Proxy) doUpstream(req *http.Request) (*http.Response, error) {
 	return p.transport.RoundTrip(req)
+}
+
+// markIfClientCancel records a client-initiated cancellation on result and
+// returns true; callers should then return without writing a 502. The wrapped
+// errors.Is on err catches transforms that report context.Canceled without
+// observing r.Context() directly.
+func markIfClientCancel(r *http.Request, err error, result *transform.PipelineResult) bool {
+	if !errors.Is(r.Context().Err(), context.Canceled) && !errors.Is(err, context.Canceled) {
+		return false
+	}
+	result.Action = transform.ActionContinue
+	result.StatusCode = http.StatusOK
+	result.ClientCanceled = true
+	return true
+}
+
+// containsDotSegments reports whether p has any "." or ".." path segment.
+func containsDotSegments(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func copyHeaders(dst, src http.Header) {

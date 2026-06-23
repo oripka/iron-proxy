@@ -14,13 +14,16 @@ type traceEntry struct {
 }
 
 // NewAuditLogger returns an AuditFunc that writes structured JSON log lines
-// for every request. Log level is INFO for allowed, WARN for rejected,
-// ERROR for errored requests.
+// for every request. Log level is INFO for allowed and stubbed, WARN for
+// rejected, ERROR for errored requests.
 func NewAuditLogger(logger *slog.Logger) AuditFunc {
 	return func(result *PipelineResult) {
 		action := actionString(result.Action)
 		if result.Err != nil {
 			action = "error"
+		}
+		if result.ClientCanceled {
+			action = "client_cancel"
 		}
 
 		attrs := []any{
@@ -36,12 +39,29 @@ func NewAuditLogger(logger *slog.Logger) AuditFunc {
 				slog.Float64("duration_ms", float64(result.Duration.Microseconds())/1000.0),
 			),
 		}
+		if result.Tunnel != nil {
+			tunnelAttrs := []any{slog.String("target", result.Tunnel.Target)}
+			if len(result.Tunnel.RequestTransforms) > 0 {
+				tunnelAttrs = append(tunnelAttrs,
+					slog.Any("request_transforms", buildTraceEntries(result.Tunnel.RequestTransforms)),
+				)
+			}
+			attrs = append(attrs, slog.Group("tunnel", tunnelAttrs...))
+		}
 
-		// Add rejected_by for reject actions
+		// Add rejected_by / stubbed_by for short-circuit actions
 		if result.Action == ActionReject {
 			for _, tr := range result.RequestTransforms {
 				if tr.Action == ActionReject {
 					attrs = append(attrs, slog.String("rejected_by", tr.Name))
+					break
+				}
+			}
+		}
+		if result.Action == ActionStub {
+			for _, tr := range result.RequestTransforms {
+				if tr.Action == ActionStub {
+					attrs = append(attrs, slog.String("stubbed_by", tr.Name))
 					break
 				}
 			}
@@ -59,10 +79,25 @@ func NewAuditLogger(logger *slog.Logger) AuditFunc {
 		if len(result.ResponseTransforms) > 0 {
 			attrs = append(attrs, slog.Any("response_transforms", buildTraceEntries(result.ResponseTransforms)))
 		}
+		if result.MCP != nil && result.MCP.MCPServer() != "" {
+			mcpAttrs := []any{slog.String("server", result.MCP.MCPServer())}
+			if msgs := result.MCP.MCPMessages(); len(msgs) > 0 {
+				mcpAttrs = append(mcpAttrs, slog.Any("messages", msgs))
+			}
+			attrs = append(attrs, slog.Group("mcp", mcpAttrs...))
+		}
+		if result.BodyCapture != nil && result.BodyCapture.RequestBody() != "" {
+			attrs = append(attrs, slog.Group("body_capture",
+				slog.String("request_body", result.BodyCapture.RequestBody()),
+				slog.Bool("request_body_truncated", result.BodyCapture.RequestBodyTruncated()),
+			))
+		}
 
 		switch {
 		case result.Err != nil:
 			logger.Error("request", attrs...)
+		case result.ClientCanceled:
+			logger.Info("request", attrs...)
 		case result.Action == ActionReject:
 			logger.Warn("request", attrs...)
 		default:
@@ -93,6 +128,8 @@ func actionString(a TransformAction) string {
 		return "allow"
 	case ActionReject:
 		return "reject"
+	case ActionStub:
+		return "stub"
 	default:
 		return "unknown"
 	}

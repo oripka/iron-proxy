@@ -18,6 +18,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -442,6 +444,92 @@ transforms:
 	require.Equal(t, "Bearer "+realSecret, gotAuth)
 }
 
+func TestHTTPProxy_ClientCancel(t *testing.T) {
+	// Upstream that blocks on a release channel so the client has a window to
+	// cancel its context while the proxy is mid-RoundTrip.
+	release := make(chan struct{})
+	reached := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(reached)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	pipeline := transform.NewPipeline(nil, transform.BodyLimits{}, testLogger())
+
+	var mu sync.Mutex
+	var results []transform.PipelineResult
+	done := make(chan struct{})
+	pipeline.SetAuditFunc(func(r *transform.PipelineResult) {
+		mu.Lock()
+		results = append(results, *r)
+		mu.Unlock()
+		close(done)
+	})
+
+	p := New(Options{
+		HTTPAddr: "127.0.0.1:0",
+		Pipeline: transform.NewPipelineHolder(pipeline),
+		Logger:   testLogger(),
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.httpServer.Serve(ln) }()
+	t.Cleanup(func() { _ = p.httpServer.Close() })
+	proxyAddr := ln.Addr().String()
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: proxyAddr}),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, "GET", upstream.URL+"/slow", nil)
+	require.NoError(t, err)
+
+	reqErr := make(chan error, 1)
+	go func() {
+		resp, err := client.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		reqErr <- err
+	}()
+
+	// Wait for the proxy to reach upstream, then cancel.
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream never reached")
+	}
+	cancel()
+
+	select {
+	case err := <-reqErr:
+		require.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("client Do never returned")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("audit never fired")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, results, 1)
+	r := results[0]
+	require.True(t, r.ClientCanceled)
+	require.Equal(t, http.StatusOK, r.StatusCode)
+	require.NoError(t, r.Err)
+	require.Equal(t, transform.ActionContinue, r.Action)
+}
+
 func TestHTTPProxy_UpstreamError(t *testing.T) {
 	_, httpAddr, _, _ := startProxy(t)
 
@@ -704,4 +792,276 @@ func TestHTTPProxy_TransformReplacesResponseBody(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	require.Equal(t, replacedBody, string(body))
+}
+
+func TestHTTPProxy_HopByHopHeadersStripped(t *testing.T) {
+	var gotHeaders http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	_, httpAddr, _, _ := startProxy(t)
+
+	// Dial the proxy as a raw TCP client so we can send arbitrary hop-by-hop
+	// headers without Go's client library normalizing them away.
+	conn, err := net.DialTimeout("tcp", httpAddr, 5*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	rawReq := fmt.Sprintf("GET /test HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Proxy-Authorization: Basic c2VjcmV0\r\n"+
+		"Proxy-Connection: keep-alive\r\n"+
+		"Connection: Cookie\r\n"+
+		"Cookie: session=leaky\r\n"+
+		"X-Custom: keepme\r\n"+
+		"\r\n",
+		upstream.Listener.Addr().String())
+	_, err = conn.Write([]byte(rawReq))
+	require.NoError(t, err)
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4096)
+	_, err = conn.Read(buf)
+	require.NoError(t, err)
+
+	require.NotNil(t, gotHeaders)
+	require.Empty(t, gotHeaders.Get("Proxy-Authorization"))
+	require.Empty(t, gotHeaders.Get("Proxy-Connection"))
+	require.Empty(t, gotHeaders.Get("Cookie"), "Cookie was named by Connection and must not be forwarded")
+	require.Equal(t, "keepme", gotHeaders.Get("X-Custom"))
+}
+
+func TestHTTPProxy_WebSocketHopByHopHeadersStripped(t *testing.T) {
+	upstreamLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer upstreamLn.Close()
+
+	gotReqCh := make(chan []byte, 1)
+	go func() {
+		conn, err := upstreamLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 4096)
+		n, _ := conn.Read(buf)
+		gotReqCh <- append([]byte(nil), buf[:n]...)
+		resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n\r\n"
+		_, _ = conn.Write([]byte(resp))
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	_, httpAddr, _, _ := startProxy(t)
+
+	conn, err := net.DialTimeout("tcp", httpAddr, 5*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	upgradeReq := fmt.Sprintf("GET /ws HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade, Cookie\r\n"+
+		"Cookie: session=leaky\r\n"+
+		"Proxy-Authorization: Basic c2VjcmV0\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"+
+		"Sec-WebSocket-Version: 13\r\n\r\n",
+		upstreamLn.Addr().String())
+	_, err = conn.Write([]byte(upgradeReq))
+	require.NoError(t, err)
+
+	var rawUpstream []byte
+	select {
+	case rawUpstream = <-gotReqCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream did not receive request")
+	}
+
+	upstreamStr := string(rawUpstream)
+	require.NotContains(t, upstreamStr, "Proxy-Authorization")
+	require.NotContains(t, upstreamStr, "session=leaky")
+	require.NotContains(t, strings.ToLower(upstreamStr), "cookie:")
+	// Go canonicalizes "Sec-WebSocket-Key" to "Sec-Websocket-Key" when the
+	// header is parsed through the server and re-serialized.
+	lower := strings.ToLower(upstreamStr)
+	require.Contains(t, lower, "sec-websocket-key")
+	require.Contains(t, lower, "upgrade: websocket")
+	require.Contains(t, lower, "connection: upgrade")
+}
+
+func TestIsWebSocketUpgrade(t *testing.T) {
+	cases := []struct {
+		name       string
+		upgrade    string
+		connection string
+		want       bool
+	}{
+		{"valid upgrade", "websocket", "Upgrade", true},
+		{"upgrade with extra tokens", "websocket", "keep-alive, Upgrade", true},
+		{"case insensitive", "WebSocket", "upgrade", true},
+		{"missing upgrade header", "", "Upgrade", false},
+		{"connection substring not token", "websocket", "notupgrade", false},
+		{"connection no upgrade", "websocket", "keep-alive", false},
+		{"upgrade not websocket", "h2c", "Upgrade", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &http.Request{Header: http.Header{}}
+			if tc.upgrade != "" {
+				r.Header.Set("Upgrade", tc.upgrade)
+			}
+			if tc.connection != "" {
+				r.Header.Set("Connection", tc.connection)
+			}
+			require.Equal(t, tc.want, isWebSocketUpgrade(r))
+		})
+	}
+}
+
+func TestHTTPProxy_RejectsDotSegmentPaths(t *testing.T) {
+	upstreamHit := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHit = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	_, httpAddr, _, _ := startProxy(t)
+
+	// Use a raw TCP write so the dot-segment path is not normalized by the
+	// Go client before reaching the proxy.
+	conn, err := net.DialTimeout("tcp", httpAddr, 5*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	rawReq := fmt.Sprintf("GET /public/../admin/secret HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"\r\n",
+		upstream.Listener.Addr().String())
+	_, err = conn.Write([]byte(rawReq))
+	require.NoError(t, err)
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	require.NoError(t, err)
+
+	require.Contains(t, string(buf[:n]), "400")
+	require.False(t, upstreamHit, "upstream must not be reached for dot-segment paths")
+}
+
+// TestHTTPProxy_PreservesEscapedSlashes verifies that %2F in the request
+// path is forwarded to the upstream as %2F rather than being decoded to /.
+// Some APIs (e.g. GCS object names under /o/<object>) treat encoded vs
+// decoded slashes as distinct path segments. See issue #155.
+func TestHTTPProxy_PreservesEscapedSlashes(t *testing.T) {
+	var gotRequestURI string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequestURI = r.RequestURI
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	_, httpAddr, _, _ := startProxy(t)
+
+	// Send via raw TCP to keep the Go client from normalizing %2F.
+	conn, err := net.DialTimeout("tcp", httpAddr, 5*time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	const rawPath = "/download/storage/v1/b/bkt/o/dir%2Fsub%2Ffile.gz?alt=media"
+	rawReq := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\n\r\n",
+		rawPath, upstream.Listener.Addr().String())
+	_, err = conn.Write([]byte(rawReq))
+	require.NoError(t, err)
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 4096)
+	_, err = conn.Read(buf)
+	require.NoError(t, err)
+
+	require.Equal(t, rawPath, gotRequestURI)
+}
+
+func TestContainsDotSegments(t *testing.T) {
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/admin/secret", false},
+		{"/admin/.secret", false},
+		{"/admin/..secret", false},
+		{"/", false},
+		{"/public/../admin", true},
+		{"/./admin", true},
+		{"/admin/..", true},
+		{"/admin/.", true},
+		{"..", true},
+		{".", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			require.Equal(t, tc.want, containsDotSegments(tc.path))
+		})
+	}
+}
+
+func TestHTTPProxy_FailsClosedUntilReady(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	caCert, caKey := generateTestCA(t)
+	cache, err := certcache.NewFromCA(caCert, caKey, 100, 72*time.Hour)
+	require.NoError(t, err)
+
+	pipeline := transform.NewPipeline(nil, transform.BodyLimits{}, testLogger())
+	audits := make(chan transform.PipelineResult, 2)
+	pipeline.SetAuditFunc(func(r *transform.PipelineResult) {
+		audits <- *r
+	})
+	holder := transform.NewPipelineHolder(pipeline)
+
+	var ready atomic.Bool
+	p := New(Options{
+		HTTPAddr:  "127.0.0.1:0",
+		CertCache: cache,
+		Pipeline:  holder,
+		Logger:    testLogger(),
+		Ready:     ready.Load,
+	})
+
+	httpLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.httpServer.Serve(httpLn) }()
+	t.Cleanup(func() { _ = p.httpServer.Close() })
+
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/test", httpLn.Addr()), nil)
+	require.NoError(t, err)
+	req.Host = upstream.Listener.Addr().String()
+
+	// Not ready: the proxy must reject rather than pass the request through
+	// an un-synced pipeline.
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	audit := <-audits
+	require.Equal(t, transform.ActionReject, audit.Action)
+	require.Equal(t, http.StatusServiceUnavailable, audit.StatusCode)
+	require.Len(t, audit.RequestTransforms, 1)
+	require.Equal(t, "ready", audit.RequestTransforms[0].Name)
+	require.Equal(t, transform.ActionReject, audit.RequestTransforms[0].Action)
+
+	// Ready: the same request flows.
+	ready.Store(true)
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
