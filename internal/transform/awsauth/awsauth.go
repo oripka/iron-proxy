@@ -211,6 +211,9 @@ func (p *staticSourceProvider) Retrieve(ctx context.Context) (aws.Credentials, e
 	if p.sessionToken != nil {
 		token, err := p.sessionToken.Get(ctx)
 		if err != nil {
+			if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(ak)), "ASIA") {
+				return creds, nil
+			}
 			return aws.Credentials{}, fmt.Errorf("session_token: %w", err)
 		}
 		creds.SessionToken = token

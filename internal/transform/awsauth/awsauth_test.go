@@ -384,6 +384,27 @@ rules:
 		require.Contains(t, req.Header.Get("Authorization"), "ASIAEXAMPLE")
 	})
 
+	t.Run("static provider ignores missing session token for long lived access key", func(t *testing.T) {
+		srcsWithMissingToken := map[string]secrets.Source{
+			"AWS_ACCESS_KEY_ID":     &staticSource{name: "ak", value: "AKIAEXAMPLE"},
+			"AWS_SECRET_ACCESS_KEY": &staticSource{name: "sk", value: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"},
+			"AWS_SESSION_TOKEN":     &staticSource{name: "token", err: fmt.Errorf("env var \"AWS_SESSION_TOKEN\" is not set or empty")},
+		}
+		a := buildTransformWith(t, `
+access_key_id:     {type: env, var: AWS_ACCESS_KEY_ID}
+secret_access_key: {type: env, var: AWS_SECRET_ACCESS_KEY}
+session_token:     {type: env, var: AWS_SESSION_TOKEN}
+rules:
+  - host: "*.amazonaws.com"
+`, mapBuilder(srcsWithMissingToken))
+
+		req := signedRequest(t, http.MethodGet, "https://bucket.s3.us-east-1.amazonaws.com/key", "us-east-1", "s3", nil, 1<<20)
+		_, err := a.TransformRequest(context.Background(), newContext(), req)
+		require.NoError(t, err)
+		require.Empty(t, req.Header.Get("X-Amz-Security-Token"))
+		require.Contains(t, req.Header.Get("Authorization"), "AKIAEXAMPLE")
+	})
+
 	t.Run("placeholder signature is stripped before re-signing", func(t *testing.T) {
 		a := buildTransformWith(t, minimalYAML, mapBuilder(srcs))
 		req := signedRequest(t, http.MethodPost, "https://bedrock-runtime.us-east-1.amazonaws.com/x", "us-east-1", "bedrock", []byte("{}"), 1<<20)
