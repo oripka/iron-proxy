@@ -30,7 +30,8 @@ Single binary. Single YAML config.
   to dial it if its resolved address falls inside a denied CIDR — closing
   the SSRF/DNS-rebinding gap where an allowlisted hostname points at IMDS
   or loopback. Cloud metadata endpoints (`169.254.169.254`) and loopback are
-  denied by default; override via `proxy.upstream_deny_cidrs`.
+  denied by default; override via `proxy.upstream_deny_cidrs` or
+  `IRON_PROXY_UPSTREAM_DENY_CIDRS`.
 - **Boundary-level secret injection.** Workloads send proxy tokens; iron-proxy
   replaces them with real secrets before the request leaves. If the sandbox is
   compromised, the attacker gets tokens that are useless outside the proxy.
@@ -40,8 +41,9 @@ Single binary. Single YAML config.
 - **Streaming-aware.** WebSocket upgrades and Server-Sent Events are proxied
   natively. No special configuration for agent workloads that hold long-lived
   connections.
-- **CONNECT and SOCKS5 support.** Optional tunnel listener for tools that
-  natively support proxy configuration via `HTTPS_PROXY` or SOCKS5 settings.
+- **Explicit proxy support.** Optional tunnel listener for tools that natively
+  support proxy configuration via `HTTP_PROXY`, `HTTPS_PROXY`, or SOCKS5
+  settings.
 - **PostgreSQL MITM proxy.** Optional listener that authenticates clients
   against proxy-managed credentials, injects `SET ROLE` on the upstream
   session, and rejects client attempts to mutate the role (`SET ROLE`,
@@ -633,12 +635,13 @@ Bodies are buffered incrementally as transforms read them, and automatically
 rewound between pipeline stages. If a transform doesn't read the body, no
 buffering occurs and the body streams through untouched.
 
-### Tunnel listener (CONNECT/SOCKS5)
+### Tunnel listener (HTTP/CONNECT/SOCKS5)
 
-The tunnel listener accepts HTTP CONNECT and SOCKS5 connections on a
-dedicated port. This is useful for tools that natively support proxy
-configuration via `HTTPS_PROXY`/`ALL_PROXY` environment variables or
-SOCKS5 settings, rather than relying on DNS-based routing.
+The tunnel listener accepts absolute-form HTTP proxy requests, HTTP CONNECT,
+and SOCKS5 connections on a dedicated port. This is useful for tools that
+natively support proxy configuration via `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`
+environment variables or SOCKS5 settings, rather than relying on DNS-based
+routing.
 
 To enable it, set `tunnel_listen` under `proxy`:
 
@@ -649,10 +652,11 @@ proxy:
 
 When omitted, the tunnel listener is disabled.
 
-Both protocols go through the same transform pipeline as regular HTTP/HTTPS
-requests. The proxy evaluates a synthetic CONNECT request against your
-allowlist and secrets transforms, so tunnel connections are subject to the
-same default-deny policy.
+All protocols go through the same transform pipeline as regular HTTP/HTTPS
+requests. Absolute-form HTTP requests are handled by the normal HTTP proxy
+path. For CONNECT and SOCKS5, the proxy evaluates a synthetic CONNECT request
+against your allowlist and secrets transforms, so tunnel connections are
+subject to the same default-deny policy.
 
 After the CONNECT or SOCKS5 handshake, the proxy peeks at the first byte to
 detect the inner protocol:
@@ -671,6 +675,13 @@ curl -x http://172.20.0.2:8080 \
   https://httpbin.org/get
 ```
 
+**Plain HTTP proxy example:**
+
+```bash
+curl -x http://172.20.0.2:8080 \
+  http://httpbin.org/get
+```
+
 **SOCKS5 example:**
 
 ```bash
@@ -683,6 +694,7 @@ You can also set the standard environment variables so all tools route
 through the tunnel automatically:
 
 ```bash
+export HTTP_PROXY=http://172.20.0.2:8080
 export HTTPS_PROXY=http://172.20.0.2:8080
 export ALL_PROXY=socks5h://172.20.0.2:8080
 ```

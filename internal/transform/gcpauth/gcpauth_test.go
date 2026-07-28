@@ -24,6 +24,7 @@ import (
 	"golang.org/x/oauth2"
 	"gopkg.in/yaml.v3"
 
+	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
 	"github.com/ironsh/iron-proxy/internal/transform/gcpjwt"
 	"github.com/ironsh/iron-proxy/internal/transform/secrets"
@@ -401,6 +402,50 @@ rules:
 	require.Equal(t, "oauth2_token_endpoint", annotations["stubbed"])
 
 	require.Empty(t, req.Header.Get("Authorization"))
+	require.Equal(t, int64(0), calls.Load(), "real GCP token endpoint must not be hit when stubbing")
+}
+
+func TestGCPAuth_StubsOAuth2TokenEndpointWithBufferedJWTBody(t *testing.T) {
+	srv, calls := fakeTokenServer(t, "minted-token", 3600)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sa.json")
+	require.NoError(t, os.WriteFile(path, testKeyfileJSON(t, srv.URL, "sa@p.iam.gserviceaccount.com"), 0o600))
+
+	cfg := config{
+		KeyfilePath: path,
+		Scopes:      []string{"https://www.googleapis.com/auth/cloud-platform"},
+		Rules: []hostmatch.RuleConfig{
+			{Host: "bigquery.googleapis.com"},
+		},
+	}
+	g, err := newFromConfig(cfg, slog.Default(), os.ReadFile, staticBuilder(&staticSource{}), errTokenSourceBuilder)
+	require.NoError(t, err)
+
+	form := url.Values{}
+	form.Set("grant_type", gcpjwt.JWTBearerGrantType)
+	form.Set("assertion", unsignedAssertion(t, map[string]any{
+		"iss":   "stub@p.iam.gserviceaccount.com",
+		"aud":   "https://oauth2.googleapis.com/token",
+		"scope": "https://www.googleapis.com/auth/cloud-platform",
+	}))
+	body := form.Encode()
+	req, err := http.NewRequest(http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(body))
+	require.NoError(t, err)
+	req.Body = transform.NewBufferedBody(req.Body, 0)
+
+	p := transform.NewPipeline([]transform.Transformer{g}, transform.BodyLimits{}, slog.Default())
+	var traces []transform.TransformTrace
+	resp, err := p.ProcessRequest(context.Background(), newContext(), req, &traces)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Len(t, traces, 1)
+	require.Equal(t, transform.ActionStub, traces[0].Action)
+	require.IsType(t, &transform.BufferedBody{}, req.Body)
+
+	restored, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.Equal(t, body, string(restored))
 	require.Equal(t, int64(0), calls.Load(), "real GCP token endpoint must not be hit when stubbing")
 }
 

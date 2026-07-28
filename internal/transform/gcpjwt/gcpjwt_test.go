@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/ironsh/iron-proxy/internal/transform"
 )
 
 func TestJWTBearerTargetAudience(t *testing.T) {
@@ -31,6 +33,27 @@ func TestJWTBearerTargetAudience(t *testing.T) {
 	require.Equal(t, body, string(restored))
 }
 
+func TestJWTBearerTargetAudiencePreservesBufferedBody(t *testing.T) {
+	form := url.Values{}
+	form.Set("grant_type", JWTBearerGrantType)
+	form.Set("assertion", unsignedAssertion(t, map[string]any{
+		"target_audience": "https://service.run.app",
+	}))
+	body := form.Encode()
+	req, err := http.NewRequest(http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(body))
+	require.NoError(t, err)
+	req.Body = transform.NewBufferedBody(req.Body, 0)
+
+	audience, ok := JWTBearerTargetAudience(req)
+	require.True(t, ok)
+	require.Equal(t, "https://service.run.app", audience)
+	require.IsType(t, &transform.BufferedBody{}, req.Body)
+
+	restored, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.Equal(t, body, string(restored))
+}
+
 func TestJWTBearerTargetAudienceRestoresOversizedBody(t *testing.T) {
 	body := strings.Repeat("x", MaxTokenRequestBodyBytes+1)
 	req, err := http.NewRequest(http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(body))
@@ -39,6 +62,22 @@ func TestJWTBearerTargetAudienceRestoresOversizedBody(t *testing.T) {
 	audience, ok := JWTBearerTargetAudience(req)
 	require.False(t, ok)
 	require.Empty(t, audience)
+
+	restored, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.Equal(t, body, string(restored))
+}
+
+func TestJWTBearerTargetAudiencePreservesBufferedOversizedBody(t *testing.T) {
+	body := strings.Repeat("x", MaxTokenRequestBodyBytes+1)
+	req, err := http.NewRequest(http.MethodPost, "https://oauth2.googleapis.com/token", strings.NewReader(body))
+	require.NoError(t, err)
+	req.Body = transform.NewBufferedBody(req.Body, 0)
+
+	audience, ok := JWTBearerTargetAudience(req)
+	require.False(t, ok)
+	require.Empty(t, audience)
+	require.IsType(t, &transform.BufferedBody{}, req.Body)
 
 	restored, err := io.ReadAll(req.Body)
 	require.NoError(t, err)

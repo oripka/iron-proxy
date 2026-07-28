@@ -53,6 +53,8 @@ proxy:
   # Set an explicit list to override the defaults. Use an empty list
   # (upstream_deny_cidrs: []) if you intentionally need to allow IMDS or
   # loopback traffic to upstreams.
+  # The equivalent environment override is a comma-separated list:
+  # IRON_PROXY_UPSTREAM_DENY_CIDRS="169.254.169.254/32,127.0.0.0/8"
   # upstream_deny_cidrs:
   #   - "169.254.169.254/32"
   #   - "127.0.0.0/8"

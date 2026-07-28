@@ -33,7 +33,7 @@ listeners, configured under `.Values.listeners`:
 | HTTP | `http` | 80/TCP | yes |
 | HTTPS | `https` | 443/TCP | yes |
 | Metrics / health (`GET /healthz`) | `metrics` | 9090/TCP | yes |
-| Tunnel (CONNECT/SOCKS5) | `tunnel` | 8080/TCP | no |
+| Tunnel (HTTP/CONNECT/SOCKS5) | `tunnel` | 8080/TCP | no |
 | Postgres MITM | `postgres` | 5432/TCP | no |
 | Management API | `management` | 9092/TCP | no |
 
@@ -57,7 +57,7 @@ listeners:
   https:
     port: 8443        # Service port, container port, and proxy bind all become 8443
   tunnel:
-    enabled: true     # turn on the optional CONNECT/SOCKS5 tunnel
+    enabled: true     # turn on the optional HTTP/CONNECT/SOCKS5 explicit proxy
   dns:
     enabled: false    # disable the DNS server entirely (IRON_DNS_ENABLED=false)
 ```

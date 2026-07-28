@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/ironsh/iron-proxy/internal/transform"
 )
 
 const (
@@ -67,16 +69,25 @@ func tokenRequestBody(req *http.Request) ([]byte, bool) {
 		return nil, false
 	}
 
+	buffered, isBuffered := req.Body.(*transform.BufferedBody)
 	body, err := io.ReadAll(io.LimitReader(req.Body, MaxTokenRequestBodyBytes+1))
 	if err != nil || len(body) > MaxTokenRequestBodyBytes {
-		req.Body = &replayReadCloser{
-			Reader: io.MultiReader(bytes.NewReader(body), req.Body),
-			closer: req.Body,
+		if isBuffered {
+			buffered.Reset()
+		} else {
+			req.Body = &replayReadCloser{
+				Reader: io.MultiReader(bytes.NewReader(body), req.Body),
+				closer: req.Body,
+			}
 		}
 		return nil, false
 	}
 	closeErr := req.Body.Close()
-	req.Body = io.NopCloser(bytes.NewReader(body))
+	if isBuffered {
+		buffered.Reset()
+	} else {
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	}
 	if closeErr != nil {
 		return nil, false
 	}
