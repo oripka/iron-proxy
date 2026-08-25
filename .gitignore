@@ -2,6 +2,9 @@
 /iron-proxy
 *.exe
 
+# GoReleaser
+/dist/
+
 # IDE
 .idea/
 .vscode/

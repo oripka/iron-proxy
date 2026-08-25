@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ironsh/iron-proxy/internal/config"
-	"github.com/ironsh/iron-proxy/internal/hostmatch"
 )
 
 // mockResolver implements Resolver for testing.
@@ -249,25 +248,4 @@ func TestStaticRecord_WrongQtypeReturnsEmpty(t *testing.T) {
 	// Ask for CNAME but only A is configured — should fall through to intercept
 	resp := query(t, addr, "only-a.example.com", dns.TypeCNAME)
 	require.Empty(t, resp.Answer)
-}
-
-func TestMatchGlob(t *testing.T) {
-	tests := []struct {
-		pattern string
-		name    string
-		want    bool
-	}{
-		{"*.example.com", "foo.example.com", true},
-		{"*.example.com", "bar.baz.example.com", true},
-		{"*.example.com", "example.com", true},
-		{"*.example.com", "notexample.com", false},
-		{"exact.example.com", "exact.example.com", true},
-		{"exact.example.com", "other.example.com", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(fmt.Sprintf("%s/%s", tt.pattern, tt.name), func(t *testing.T) {
-			require.Equal(t, tt.want, hostmatch.MatchGlob(tt.pattern, tt.name))
-		})
-	}
 }

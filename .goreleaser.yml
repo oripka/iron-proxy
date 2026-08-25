@@ -1,7 +1,10 @@
 version: 2
 
+dist: dist/iron-proxy
+
 builds:
-  - main: ./cmd/iron-proxy
+  - id: iron-proxy
+    main: ./cmd/iron-proxy
     binary: iron-proxy
     env:
       - CGO_ENABLED=0
@@ -12,22 +15,31 @@ builds:
       - amd64
       - arm64
     ldflags:
-      - -s -w -X main.version={{.Version}}
+      - -s -w -X github.com/ironsh/iron-proxy/internal/version.Version={{.Version}}
 
 archives:
-  - formats: ["tar.gz"]
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: iron-proxy
+    ids:
+      - iron-proxy
+    formats: ["tar.gz"]
+    name_template: "iron-proxy_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 dockers_v2:
-  - images:
+  - id: iron-proxy
+    ids:
+      - iron-proxy
+    images:
       - "ironsh/iron-proxy"
     tags:
       - "{{ .Version }}"
-      - "latest"
+      - '{{ if not .Prerelease }}latest{{ end }}'
     dockerfile: Dockerfile.release
 
 checksum:
   name_template: "checksums.txt"
+
+release:
+  prerelease: auto
 
 changelog:
   sort: asc

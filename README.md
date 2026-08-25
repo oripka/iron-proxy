@@ -26,6 +26,13 @@ Single binary. Single YAML config.
 - **Default-deny egress.** Every outbound request is blocked unless the
   destination matches your allowlist. List your domains and CIDRs, everything
   else gets a 403.
+- **Upstream IP deny list.** Even when a host is allowed, the proxy refuses
+  to dial it if its resolved address falls inside a denied CIDR — closing
+  the SSRF/DNS-rebinding gap where an allowlisted hostname points at IMDS
+  or loopback. Cloud metadata endpoints (`169.254.169.254`,
+  `fd00:ec2::254`, and `fd20:ce::254`) and loopback are denied by default;
+  override via `proxy.upstream_deny_cidrs` or
+  `IRON_PROXY_UPSTREAM_DENY_CIDRS`.
 - **Boundary-level secret injection.** Workloads send proxy tokens; iron-proxy
   replaces them with real secrets before the request leaves. If the sandbox is
   compromised, the attacker gets tokens that are useless outside the proxy.
@@ -35,8 +42,18 @@ Single binary. Single YAML config.
 - **Streaming-aware.** WebSocket upgrades and Server-Sent Events are proxied
   natively. No special configuration for agent workloads that hold long-lived
   connections.
-- **CONNECT and SOCKS5 support.** Optional tunnel listener for tools that
-  natively support proxy configuration via `HTTPS_PROXY` or SOCKS5 settings.
+- **Explicit proxy support.** Optional tunnel listener for tools that natively
+  support proxy configuration via `HTTP_PROXY`, `HTTPS_PROXY`, or SOCKS5
+  settings.
+- **PostgreSQL MITM proxy.** Optional listener that authenticates clients
+  against proxy-managed credentials, injects `SET ROLE` on the upstream
+  session, and rejects client attempts to mutate the role (`SET ROLE`,
+  `set_config('role', ...)`, DO blocks, etc.) via a SQL AST walk. Pairs with
+  PostgreSQL row-level security to give per-tenant data isolation when the
+  application connects as a shared service-account user. **Requires
+  PgBouncer (if used) to run in `pool_mode = session`** — transaction or
+  statement pool modes silently rebind backends between queries and would
+  defeat the policy. See [docs.iron.sh](https://docs.iron.sh) for details.
 
 Built for CI pipelines, GitHub Actions, AI agents (Claude Code, Cursor,
 Codex), and any environment where you run code you don't fully trust.
@@ -180,19 +197,11 @@ far more complexity than the problem requires.
 
 ## How it works
 
-iron-proxy runs a DNS server and an HTTP/HTTPS proxy. You can route traffic to
-it in two ways:
-
-- **Transparent / DNS-steered mode:** point your container's DNS at iron-proxy
-  so hostnames resolve to the proxy IP and HTTP/HTTPS traffic lands on the
-  proxy automatically.
-- **Explicit proxy mode:** point `HTTP_PROXY` / `HTTPS_PROXY` at iron-proxy.
-  Plain HTTP uses regular forward-proxy request routing; HTTPS uses `CONNECT`,
-  after which iron-proxy performs the same TLS MITM and transform pipeline.
-
-In either mode, the proxy terminates TLS (generating leaf certs on the fly from
-a CA you provide), runs the request through an ordered transform pipeline,
-forwards it upstream, and runs the response back through the pipeline.
+iron-proxy runs a DNS server and an HTTP/HTTPS proxy. Point your container's DNS
+at iron-proxy and all hostname lookups resolve to the proxy IP, routing traffic
+through it automatically. The proxy terminates TLS (generating leaf certs on the
+fly from a CA you provide), runs the request through an ordered transform
+pipeline, forwards it upstream, and runs the response back through the pipeline.
 
 ```
 Container → DNS lookup → iron-proxy IP → TLS termination → transforms → upstream
@@ -202,9 +211,9 @@ Transforms run in order. Built-in transforms:
 
 | Transform   | What it does                                                                                                            |
 | ----------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `allowlist` | Permits requests to matching domains/CIDRs; rejects everything else (403).                                              |
-| `interactive_policy` | Permits configured host/method/path rules and delegates misses to an external local policy service.             |
-| `secrets`   | Scans headers, query params, and optionally body for proxy tokens and swaps in real secrets from environment variables. |
+| `allowlist`    | Permits requests to matching domains/CIDRs; rejects everything else (403).                                              |
+| `secrets`      | Scans headers (and optionally query, path, or body) for proxy tokens and swaps in real secrets from environment variables. |
+| `body_capture` | Records decoded request bodies of matching hosts as `request_body` audit fields. Observation-only; never rejects.       |
 
 ## Configuration
 
@@ -272,6 +281,36 @@ through the proxy. Exceptions:
   `*.internal.corp`). Traffic to these hosts bypasses the proxy entirely.
 - **`records`:** static A or CNAME records. Highest precedence.
 
+### Response retry handler
+
+Set `IRON_RESPONSE_RETRY_HANDLER_URL`,
+`IRON_RESPONSE_RETRY_COMPLETE_URL`, `IRON_RESPONSE_RETRY_HANDLER_TOKEN`,
+`IRON_RESPONSE_RETRY_HANDLER_SANDBOX_ID`, and a comma-separated
+`IRON_RESPONSE_RETRY_STATUSES` list to enable externally authorized response
+retries. The authorization handler receives the exact upstream scheme, authority, method,
+path/query, replayability, response status and headers, trace context, and
+sandbox identity. It may return request headers plus an attempt ID for one
+exact replay. The completion handler then receives the replay status and
+response headers selected by `IRON_RESPONSE_RETRY_COMPLETION_HEADERS`, which
+defaults to `Payment-Receipt`.
+
+Response bodies are never sent to either handler, destinations cannot change,
+and connection/framing headers are rejected. Requests over
+`proxy.max_request_body_bytes` proceed normally but are marked non-replayable;
+if challenged, their original response is returned. Handler failures also
+preserve the original response. Handler URLs must use HTTPS unless loopback or
+`IRON_RESPONSE_RETRY_HANDLER_ALLOW_HTTP=true` is explicitly configured for a
+trusted internal network. Redirects are rejected, and the response retry token
+must be configured independently from the control-plane token. WebSocket,
+gRPC, and unknown-length streaming requests bypass response retry handling.
+
+When a trusted handler resolves inside `proxy.upstream_deny_cidrs`, set
+`IRON_RESPONSE_RETRY_HANDLER_ALLOW_CIDRS` to a comma-separated list of the
+narrow private CIDRs it may use. This exception applies only to the exact
+configured authorize and complete endpoints; ordinary proxied traffic remains
+subject to the full upstream deny list. Public, loopback, link-local, and cloud
+metadata ranges cannot be added through this setting.
+
 ### Allowlist
 
 Default-deny. Requests must match at least one domain glob or CIDR to proceed.
@@ -316,48 +355,299 @@ transforms:
           headers: ["x-request-id"]
 ```
 
-### Interactive policy
+### Header allowlist
 
-`interactive_policy` is intended for local wrappers such as Guard. It allows
-configured rules immediately, and when a request misses those rules it POSTs
-safe request metadata to an external policy service. The service returns
-`{"action":"allow"}` or `{"action":"deny"}`.
+Default-deny request header filter. Any request header whose canonical name is
+not in the configured `headers` list is stripped before the request goes
+upstream. Useful for blocking tracking, fingerprinting, or accidental leakage
+headers (cookies, internal correlation IDs, `X-Forwarded-*`, etc.) that the
+sandbox might attach.
+
+Entries are matched case-insensitively against the canonical header name.
+Patterns delimited by `/.../` (e.g. `/^X-Trace-.*$/`) are case-insensitive
+regular expressions, mirroring the `secrets` transform's `match_headers`
+syntax.
+
+Optional `rules` limit the allowlist to specific hosts/methods/paths. When
+omitted, the allowlist applies to every request that reaches this transform.
+
+When at least one header is stripped, the trace is annotated with
+`stripped_headers` listing the removed names.
+
+> **Placement:** put `header_allowlist` *after* `secrets` (so injected
+> credentials are not stripped if not in the allowlist, you can list them) and
+> *after* `annotate` (so annotation reads the original headers).
 
 ```yaml
 transforms:
-  - name: interactive_policy
+  - name: header_allowlist
     config:
-      endpoint: "http://127.0.0.1:17891/decision"
-      timeout_ms: 300000
+      headers:
+        - "Authorization"
+        - "Content-Type"
+        - "User-Agent"
+        - "Accept"
+        - "/^X-Trace-.*$/"
       rules:
         - host: "api.openai.com"
-          methods: ["POST"]
-          paths: ["/v1/responses", "/v1/oripka/*"]
 ```
 
-The request payload includes `host`, `method`, `path`, a query-redacted `url`,
-SNI, and safe headers. Sensitive headers such as `Authorization`, `Cookie`, and
-`Proxy-Authorization` are not sent to the policy service.
+### Body capture
+
+Records the decoded request body of matching requests and surfaces it on the
+audit log record in a `body_capture` group holding `request_body` and
+`request_body_truncated`. Useful for auditing the payloads passing through the
+proxy, such as the prompts a sandbox sends to an LLM provider, without
+modifying the upstream traffic.
+
+Hosts, methods, and paths are matched with the same `rules` syntax as
+`allowlist` and `secrets`. `max_request_body_bytes` caps how much of each body
+is captured; bodies larger than the cap are truncated to the prefix and
+`request_body_truncated` is set to `true`. The cap defaults to 16 KiB and is
+independent of the global `proxy.max_request_body_bytes` limit. This transform
+is observation-only: it never rejects a request, and body read errors are
+annotated on the trace rather than failing the request.
+
+On a successful capture, the transform's entry in `request_transforms` is
+annotated with `captured_bytes` and `truncated` so the trace records that a
+body was captured without duplicating the body itself.
+
+Response bodies are not captured. Streaming responses (SSE) would have to be
+buffered end-to-end before forwarding, which would stall the client.
+
+> **Warning:** Captured bodies are written to the audit log in plain text. When
+> `secrets` runs with `match_body: true`, place `body_capture` *before* `secrets`
+> so the audit log records the sandbox's proxy tokens rather than the real
+> credentials `secrets` swaps into the body.
+
+```yaml
+transforms:
+  - name: body_capture
+    config:
+      max_request_body_bytes: 16384
+      rules:
+        - host: "api.anthropic.com"
+          methods: ["POST"]
+          paths: ["/v1/messages"]
+        - host: "api.openai.com"
+          methods: ["POST"]
+          paths: ["/v1/chat/completions"]
+```
 
 ### Secrets
 
 The sandbox never holds real credentials. Instead:
 
-1. Set real secrets as environment variables on the iron-proxy container.
+1. Configure iron-proxy with the real secret source: environment variables, a
+   file on disk, AWS Secrets Manager, AWS Systems Manager Parameter Store,
+   1Password (service account), or 1Password Connect.
 2. Give the sandbox a proxy token (e.g., `proxy-openai-abc123`).
-3. Configure the `secrets` transform to map proxy tokens to env vars.
+3. Configure the `secrets` transform to map proxy tokens to those sources.
 
 iron-proxy scans outbound requests and replaces proxy tokens with the real
 values before forwarding upstream. You control where it looks:
 
 - **`match_headers`:** list of header names to scan. Empty list = all headers.
+  Literal names are matched case-insensitively, but the casing you write is
+  preserved when the header is forwarded upstream. Entries delimited by `/.../`
+  are compiled as case-insensitive regular expressions matched against canonical
+  header names (e.g. `/^x-.*-key$/`).
 - **`match_body`:** scan the request body (buffered up to `max_request_body_bytes`).
+- **`match_query`:** scan the URL query string. Defaults to `false`; opt in for
+  upstreams that expect the secret in a query parameter. Query strings often
+  appear in access logs on either side of the proxy, so this is off by default.
+- **`match_path`:** scan the URL path. Defaults to `false`; opt in for upstreams
+  like Telegram that embed the secret in the path (e.g.
+  `/bot<TOKEN>/sendMessage`). URL paths often appear in access logs on either
+  side of the proxy, so this is off by default.
 - **`require`:** when `true`, requests to a matching host that do **not** contain
   the proxy token are rejected with 403. This prevents a compromised workload
   from bypassing the secret-swap mechanism with alternative credentials. Default: `false`.
 - **`hosts`:** restrict swapping to specific domains or CIDRs.
 
 Query parameters are always scanned.
+
+Secret sources:
+
+- **`env`:** reads `var` from the proxy process environment. Fixed at process
+  start — use `file` instead if you need to rotate the value on a running proxy.
+- **`file`:** reads the secret from `path` on disk. The file is re-read on every
+  config reload (boot and each `POST /v1/reload`) and, when `ttl` is set, on
+  cache expiry — so you can rotate a running proxy's secret by rewriting the
+  file (atomically: write-temp + rename) and reloading, without a restart. The
+  value is the exact file contents (no trimming), so the writer controls
+  trailing whitespace. Optional `ttl` and `failure_ttl` are supported.
+- **`aws_sm`:** reads `secret_id` from AWS Secrets Manager. Optional `region`,
+  `ttl`, and `failure_ttl` are supported.
+- **`aws_ssm`:** reads `name` from AWS Systems Manager Parameter Store. Optional
+  `region`, `with_decryption`, `ttl`, and `failure_ttl` are supported.
+  `with_decryption` defaults to `true`, which is the expected setting for
+  `SecureString` parameters.
+- **`1password`:** resolves `secret_ref` (an `op://vault/item/[section/]field`
+  reference) using a 1Password service account token. The token is read from
+  `OP_SERVICE_ACCOUNT_TOKEN`. Optional `ttl` and `failure_ttl` are supported.
+- **`1password_connect`:** resolves the same `op://vault/item/[section/]field`
+  `secret_ref` against a self-hosted 1Password Connect server. The server URL
+  is read from `OP_CONNECT_HOST` and the API token from `OP_CONNECT_TOKEN`.
+  Optional `ttl` and `failure_ttl` are supported.
+
+Every source also accepts an optional `json_key`. When set, the resolved value
+is parsed as a JSON object and the single top-level string field at that key is
+extracted. Use it to pull one field out of a JSON secret.
+
+`ttl` controls how long a successfully fetched value is cached before refresh
+(empty caches forever). `failure_ttl` controls how long a fetch error is
+cached before retrying; it defaults to 1m and is independent of `ttl`, so a
+long success TTL does not delay recovery from a transient backend outage.
+
+  > **Note:** a bug in `onepassword-sdk-go` breaks builds with `CGO_ENABLED=0`,
+  > so iron-proxy pins a [fork](https://github.com/ironsh/onepassword-sdk-go)
+  > via a `replace` directive in `go.mod` until the fix lands upstream.
+
+### Judge
+
+The judge transform calls an LLM to produce an allow/deny decision for
+requests that match its URL rules. Each entry under `transforms:` is an
+independent judge instance with its own natural-language policy, LLM backend,
+timeout, semaphore, and circuit breaker. Operators can deploy zero, one, or
+many judges with different prompts scoped to different rules.
+
+```yaml
+- name: judge
+  config:
+    name: "github-write-guard"    # required; identifies the instance in audit logs
+    fallback: "deny"              # deny (default) | skip. No "allow" fallback ships in v1.
+    timeout: "8s"                 # per-call LLM timeout
+    max_concurrent: 100           # semaphore capacity; additional calls wait
+    circuit_breaker:
+      consecutive_failures: 5
+      cooldown: "10s"
+    rules:                        # uses the same matcher as allowlist/secrets
+      - host: "api.github.com"
+        methods: ["POST", "PATCH", "DELETE", "PUT"]
+    provider:
+      type: "anthropic"           # "anthropic" or "openai"
+      model: "claude-haiku-4-5-20251001"
+      api_key_env: "ANTHROPIC_API_KEY"
+      max_tokens: 256
+    prompt: |
+      Natural-language policy describing what is allowed for requests that
+      match the rules above. Kept short and specific.
+```
+
+Invariants:
+
+- The judge can only reject. It never approves a request the static allowlist
+  would have denied. Static deny always wins.
+- Non-matching requests are ignored: no LLM call, no audit annotations.
+- On LLM error, timeout, circuit-breaker-open, or malformed model output, the
+  configured `fallback` applies. `deny` blocks the request (the recommended
+  default for production). `skip` defers to the rest of the pipeline; since
+  iron-proxy is default-deny, unmatched requests are still blocked.
+
+Pipeline ordering with the secrets transform:
+
+- **Recommended:** place the judge **before** the secrets transform. The LLM
+  provider sees proxy tokens, never the real credentials the workload has
+  access to.
+- Alternatively, placing the judge after secrets lets it evaluate the exact
+  wire form that will egress, at the cost of sending real credentials to the
+  LLM provider. Only choose this if your threat model accepts that trade.
+
+Supported providers:
+
+- **`anthropic`** (Messages API). Uses `api_key_env`, `model`, optional
+  `base_url` and `max_tokens`.
+- **`openai`** (Chat Completions API). Same fields as above; set
+  `type: openai`, point `api_key_env` at the env var holding your OpenAI
+  key, and pick a model like `gpt-5.4-nano`.
+
+Audit output: every matched request adds structured fields under the transform
+trace, including `judge.instance`, `judge.decision`, `judge.reason`,
+`judge.duration_ms`, `judge.input_tokens`, `judge.output_tokens`,
+`judge.fallback_applied` (when a fallback fires), and
+`judge.circuit_breaker_tripped` (when the breaker is open).
+
+Credits: thanks to Brex for their CrabTrap project (MIT-licensed), which
+informed this design.
+
+## MCP policy
+
+iron-proxy can speak [MCP's Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports). When a request matches a configured MCP server, the proxy parses the JSON-RPC body, applies a default-deny tool allowlist, and filters `tools/list` responses so denied tools never reach the agent. SSE responses are filtered per event so long-lived MCP streams stay live.
+
+This is a first-class proxy capability rather than a transform: MCP responses can be open-ended SSE streams carrying arbitrary server-initiated messages, which does not fit the request/response transform contract.
+
+```yaml
+mcp:
+  # JSON-RPC error envelope returned to the agent on policy denial.
+  # Defaults: code -32001, message "blocked by iron-proxy policy".
+  error:
+    code: -32001
+    message: "blocked by iron-proxy policy"
+  servers:
+    - name: github                         # appears in audit as mcp.server
+      rules:                               # standard host/method/path rules
+        - host: "mcp.github.com"
+          paths: ["/mcp", "/mcp/*"]
+      tools:
+        - name: "search_repositories"      # always allowed
+        - name: "create_issue"
+          when:                            # all clauses must hold; otherwise deny
+            - path: "owner"                # dotted path against arguments
+              equals: "ironsh"
+            - path: "repo"
+              in: ["iron-proxy", "tunis-v2"]
+        # Anything not listed is denied (default-deny).
+```
+
+Behavior:
+
+- **`tools/call` enforcement.** Calls to tools that are not in the server's `tools` list, or whose `arguments` fail any `when` clause, are rejected without reaching upstream. The proxy returns a JSON-RPC error response with the configured code and message and the request's original `id`, so the MCP client sees a normal protocol error rather than an HTTP failure.
+- **`tools/list` filtering.** Responses to `tools/list` have any tool not on the allowlist removed before reaching the agent. Works for both `application/json` and `text/event-stream` responses; SSE filtering operates per event so heartbeats and other messages on the stream pass through untouched.
+- **Argument matching.** Each `when` clause has a dotted `path` (e.g. `arguments.repo`, `labels.0`) and one of `equals` (any JSON scalar), `in` (a list of scalars), or `matches` (a regex on string values). Clauses AND together. Omitting `when` allows the tool unconditionally.
+- **Audit.** Every observed JSON-RPC message is recorded under a new `mcp` section in the audit log entry: server name, direction (`request` or `response`), method, tool, decision (`allow`, `deny`, or `filtered`), reason on denials, and the count of tools removed on filter events.
+
+Pipeline ordering: the MCP interceptor runs after the transform pipeline, so `allowlist` still gates which hosts can be reached and `secrets` has already swapped proxy tokens by the time the interceptor evaluates the body.
+
+### MCP Gateway
+
+`mcp_gateway` routes client-facing MCP hosts to concrete upstream servers after the MCP policy accepts the request. This lets agents call stable internal hosts while iron-proxy forwards to the real upstream and injects credentials that never enter the sandbox.
+
+Gateway routes only apply to requests that matched an MCP server. The MCP policy still enforces the tool allowlist first. If policy denies a `tools/call`, the gateway route is not applied and upstream is not reached.
+
+```yaml
+mcp:
+  servers:
+    - name: github
+      rules:
+        - host: "github.mcp.local"
+          paths: ["/mcp", "/mcp/*"]
+      tools:
+        - name: "search_repositories"
+
+mcp_gateway:
+  routes:
+    - name: github
+      rules:
+        - host: "github.mcp.local"
+          paths: ["/mcp", "/mcp/*"]
+      upstream: "https://mcp.github.com/v1"
+      credentials:
+        - source:
+            type: env
+            var: GITHUB_MCP_TOKEN
+          inject:
+            header: Authorization
+            formatter: "Bearer {{ .Value }}"
+```
+
+Credentials use the same secret sources as the `secrets` transform. They are required by default. Set `require: false` on a credential to skip it when unavailable. Audit logs record the route, upstream URL, and credential injection locations, but never the injected credential values.
+
+Limitations in v1:
+
+- Only Streamable HTTP transport is supported. The legacy HTTP+SSE transport (separate `/messages` and `/sse` endpoints) is not.
+- A JSON-RPC batch with any denied entry is rejected as a whole batch; partial-batch forwarding is not supported.
+- Resources and prompts are not enforced. Agents can still call `resources/list`, `resources/read`, etc. without policy filtering.
 
 ### Body limits
 
@@ -376,12 +666,13 @@ Bodies are buffered incrementally as transforms read them, and automatically
 rewound between pipeline stages. If a transform doesn't read the body, no
 buffering occurs and the body streams through untouched.
 
-### Tunnel listener (CONNECT/SOCKS5)
+### Tunnel listener (HTTP/CONNECT/SOCKS5)
 
-The tunnel listener accepts HTTP CONNECT and SOCKS5 connections on a
-dedicated port. This is useful for tools that natively support proxy
-configuration via `HTTPS_PROXY`/`ALL_PROXY` environment variables or
-SOCKS5 settings, rather than relying on DNS-based routing.
+The tunnel listener accepts absolute-form HTTP proxy requests, HTTP CONNECT,
+and SOCKS5 connections on a dedicated port. This is useful for tools that
+natively support proxy configuration via `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`
+environment variables or SOCKS5 settings, rather than relying on DNS-based
+routing.
 
 To enable it, set `tunnel_listen` under `proxy`:
 
@@ -392,10 +683,11 @@ proxy:
 
 When omitted, the tunnel listener is disabled.
 
-Both protocols go through the same transform pipeline as regular HTTP/HTTPS
-requests. The proxy evaluates a synthetic CONNECT request against your
-allowlist and secrets transforms, so tunnel connections are subject to the
-same default-deny policy.
+All protocols go through the same transform pipeline as regular HTTP/HTTPS
+requests. Absolute-form HTTP requests are handled by the normal HTTP proxy
+path. For CONNECT and SOCKS5, the proxy evaluates a synthetic CONNECT request
+against your allowlist and secrets transforms, so tunnel connections are
+subject to the same default-deny policy.
 
 After the CONNECT or SOCKS5 handshake, the proxy peeks at the first byte to
 detect the inner protocol:
@@ -414,6 +706,13 @@ curl -x http://172.20.0.2:8080 \
   https://httpbin.org/get
 ```
 
+**Plain HTTP proxy example:**
+
+```bash
+curl -x http://172.20.0.2:8080 \
+  http://httpbin.org/get
+```
+
 **SOCKS5 example:**
 
 ```bash
@@ -426,6 +725,7 @@ You can also set the standard environment variables so all tools route
 through the tunnel automatically:
 
 ```bash
+export HTTP_PROXY=http://172.20.0.2:8080
 export HTTPS_PROXY=http://172.20.0.2:8080
 export ALL_PROXY=socks5h://172.20.0.2:8080
 ```
@@ -441,24 +741,7 @@ it via `--cacert`). Certs are cached in an LRU cache keyed by SNI hostname.
 
 ## Routing traffic to the proxy
 
-There are four approaches, with increasing enforcement.
-
-### Explicit proxy (`HTTP_PROXY` / `HTTPS_PROXY`)
-
-Point your workload's proxy environment variables at iron-proxy. This works well
-when the application already supports explicit outbound proxying and you want to
-keep DNS policy separate:
-
-```bash
-export HTTP_PROXY=http://iron-proxy.internal:10000
-export HTTPS_PROXY=http://iron-proxy.internal:10000
-```
-
-For HTTPS, clients establish a `CONNECT` tunnel to iron-proxy. iron-proxy then
-terminates TLS inside that tunnel, applies the allowlist and secrets
-transforms, and opens a new upstream TLS connection to the real destination.
-
-The client must still trust the iron-proxy CA for HTTPS interception to work.
+There are three approaches, with increasing enforcement.
 
 ### DNS-based (simple)
 
@@ -625,8 +908,10 @@ transforms:
         - source:
             type: env
             var: OPENAI_API_KEY
-          proxy_value: "proxy-openai-abc123"
-          match_headers: ["Authorization"]
+          replace:
+            proxy_value: "proxy-openai-abc123"
+            match_headers: ["Authorization"]
+            match_query: true # scan the query string
           rules:
             - host: "httpbin.org"
 
@@ -720,6 +1005,34 @@ When enabled, every audit event is emitted as an OTEL log record alongside the
 existing JSON stderr logs. The log record carries the same schema as the JSON
 audit entry: `host`, `method`, `path`, `action`, `status_code`, `duration_ms`,
 and the full `request_transforms`/`response_transforms` arrays with annotations.
+
+## Management API
+
+iron-proxy can optionally expose an authenticated HTTP API for operational
+tasks. Currently it serves a single endpoint, `POST /v1/reload`, which re-reads
+the YAML config from disk and atomically swaps in a freshly built transform
+pipeline. The running pipeline is preserved if the new config is invalid.
+
+The management server is disabled by default. To enable, add a `management`
+block to your config:
+
+```yaml
+management:
+  # Bind on loopback unless you front this with a private network or auth proxy:
+  # /v1/reload can rebuild the entire transform pipeline.
+  listen: "127.0.0.1:9092"
+  # Env var that holds the bearer token. Defaults to IRON_MANAGEMENT_API_KEY.
+  api_key_env: "IRON_MANAGEMENT_API_KEY"
+```
+
+Standalone mode only — incompatible with control-plane managed mode.
+
+Reload a running proxy:
+
+```bash
+curl -X POST http://127.0.0.1:9092/v1/reload \
+  -H "Authorization: Bearer $IRON_MANAGEMENT_API_KEY"
+```
 
 ## iron.sh
 

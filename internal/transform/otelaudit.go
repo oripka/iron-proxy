@@ -3,6 +3,7 @@ package transform
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"go.opentelemetry.io/otel/log"
@@ -46,6 +47,7 @@ func NewOTELAuditFunc(provider *sdklog.LoggerProvider) AuditFunc {
 			log.String("path", result.Path),
 			log.String("remote_addr", result.RemoteAddr),
 			log.String("sni", result.SNI),
+			log.String("mode", result.Mode.String()),
 			log.String("action", action),
 			log.Int("status_code", result.StatusCode),
 			log.Float64("duration_ms", float64(result.Duration.Microseconds())/1000.0),
@@ -55,6 +57,14 @@ func NewOTELAuditFunc(provider *sdklog.LoggerProvider) AuditFunc {
 			for _, tr := range result.RequestTransforms {
 				if tr.Action == ActionReject {
 					attrs = append(attrs, log.String("rejected_by", tr.Name))
+					break
+				}
+			}
+		}
+		if result.Action == ActionStub {
+			for _, tr := range result.RequestTransforms {
+				if tr.Action == ActionStub {
+					attrs = append(attrs, log.String("stubbed_by", tr.Name))
 					break
 				}
 			}
@@ -75,6 +85,26 @@ func NewOTELAuditFunc(provider *sdklog.LoggerProvider) AuditFunc {
 				Key:   "response_transforms",
 				Value: transformTracesValue(result.ResponseTransforms),
 			})
+		}
+		if result.MCP != nil && result.MCP.MCPServer() != "" {
+			mcpKVs := []log.KeyValue{log.String("server", result.MCP.MCPServer())}
+			if msgs := result.MCP.MCPMessages(); len(msgs) > 0 {
+				vals := make([]log.Value, len(msgs))
+				for i, m := range msgs {
+					vals[i] = toLogValue(m)
+				}
+				mcpKVs = append(mcpKVs, log.KeyValue{Key: "messages", Value: log.SliceValue(vals...)})
+			}
+			if gateway := result.MCP.MCPGateway(); len(gateway) > 0 {
+				mcpKVs = append(mcpKVs, log.KeyValue{Key: "gateway", Value: toLogValue(gateway)})
+			}
+			attrs = append(attrs, log.KeyValue{Key: "mcp", Value: log.MapValue(mcpKVs...)})
+		}
+		if result.BodyCapture != nil && result.BodyCapture.RequestBody() != "" {
+			attrs = append(attrs, log.KeyValue{Key: "body_capture", Value: log.MapValue(
+				log.String("request_body", result.BodyCapture.RequestBody()),
+				log.Bool("request_body_truncated", result.BodyCapture.RequestBodyTruncated()),
+			)})
 		}
 
 		rec.AddAttributes(attrs...)
@@ -140,14 +170,49 @@ func transformTracesValue(traces []TransformTrace) log.Value {
 	return log.SliceValue(vals...)
 }
 
-// annotationsValue converts an arbitrary map[string]any into an OTEL log Value.
-// Since annotations can contain nested structures (e.g. swapped secret lists),
-// we JSON-encode the entire map as a string for maximum compatibility with
-// OTEL backends.
+// annotationsValue converts an arbitrary map[string]any into an OTEL log Value,
+// preserving nested structure. Annotation values may be arbitrary Go types
+// (structs, slices, maps), so we round-trip through JSON to normalize everything
+// into primitives, maps, and slices before building the log.Value tree.
 func annotationsValue(annotations map[string]any) log.Value {
 	data, err := json.Marshal(annotations)
 	if err != nil {
 		return log.StringValue("{}")
 	}
-	return log.StringValue(string(data))
+	var normalized any
+	if err := json.Unmarshal(data, &normalized); err != nil {
+		return log.StringValue("{}")
+	}
+	return toLogValue(normalized)
+}
+
+func toLogValue(v any) log.Value {
+	switch x := v.(type) {
+	case nil:
+		return log.Value{}
+	case bool:
+		return log.BoolValue(x)
+	case string:
+		return log.StringValue(x)
+	case int:
+		return log.Int64Value(int64(x))
+	case int64:
+		return log.Int64Value(x)
+	case float64:
+		return log.Float64Value(x)
+	case []any:
+		vals := make([]log.Value, len(x))
+		for i, item := range x {
+			vals[i] = toLogValue(item)
+		}
+		return log.SliceValue(vals...)
+	case map[string]any:
+		kvs := make([]log.KeyValue, 0, len(x))
+		for k, val := range x {
+			kvs = append(kvs, log.KeyValue{Key: k, Value: toLogValue(val)})
+		}
+		return log.MapValue(kvs...)
+	default:
+		return log.StringValue(fmt.Sprintf("%v", x))
+	}
 }
