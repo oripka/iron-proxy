@@ -109,8 +109,9 @@ func startProxyWithPipeline(t *testing.T, pipeline *transform.Pipeline) (*Proxy,
 
 // replacerTransform replaces request and response bodies with fixed-size padding.
 type replacerTransform struct {
-	reqBody  []byte
-	respBody []byte
+	reqBody    []byte
+	reqHeaders http.Header
+	respBody   []byte
 }
 
 func (r *replacerTransform) Name() string { return "replacer" }
@@ -124,6 +125,7 @@ func (r *replacerTransform) TransformRequest(_ context.Context, _ *transform.Tra
 		req.Body = transform.NewBufferedBodyFromBytes(r.reqBody)
 		req.ContentLength = int64(len(r.reqBody))
 	}
+	copyHeaders(req.Header, r.reqHeaders)
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 
@@ -1147,6 +1149,91 @@ func TestContainsDotSegments(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {
 			require.Equal(t, tc.want, containsDotSegments(tc.path))
+		})
+	}
+}
+
+func TestPrepareReplayBodyBoundaries(t *testing.T) {
+	cases := []struct {
+		name          string
+		body          string
+		contentLength int64
+		limit         int64
+		wantReplay    bool
+	}{
+		{name: "below limit", body: "1234", contentLength: 4, limit: 5, wantReplay: true},
+		{name: "at limit", body: "12345", contentLength: 5, limit: 5, wantReplay: true},
+		{name: "known over limit", body: "123456", contentLength: 6, limit: 5, wantReplay: false},
+		{name: "unknown at limit", body: "12345", contentLength: -1, limit: 5, wantReplay: true},
+		{name: "unknown over limit", body: "123456", contentLength: -1, limit: 5, wantReplay: false},
+		{name: "disabled", body: "12345", contentLength: 5, limit: 0, wantReplay: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared, replayBody, replayable, err := prepareReplayBody(
+				io.NopCloser(strings.NewReader(tc.body)),
+				tc.contentLength,
+				tc.limit,
+			)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantReplay, replayable)
+			if tc.wantReplay {
+				require.Equal(t, []byte(tc.body), replayBody)
+			} else {
+				require.Nil(t, replayBody)
+			}
+			got, err := io.ReadAll(prepared)
+			require.NoError(t, err)
+			require.NoError(t, prepared.Close())
+			require.Equal(t, tc.body, string(got))
+		})
+	}
+}
+
+func TestResponseRetryEligible(t *testing.T) {
+	cases := []struct {
+		name          string
+		method        string
+		contentType   string
+		contentLength int64
+		connection    string
+		upgrade       string
+		want          bool
+	}{
+		{name: "ordinary GET", method: http.MethodGet, contentLength: 0, want: true},
+		{name: "ordinary HEAD", method: http.MethodHead, contentLength: 0, want: true},
+		{name: "ordinary known body", method: http.MethodPost, contentType: "application/json", contentLength: 4, want: true},
+		{name: "known body with content type parameters", method: http.MethodPost, contentType: "application/json; charset=utf-8", contentLength: 4, want: true},
+		{name: "known body without content type", method: http.MethodPost, contentLength: 4, want: true},
+		{name: "unknown length with content type", method: http.MethodPost, contentType: "application/json", contentLength: -1, want: false},
+		{name: "unknown length without content type", method: http.MethodPost, contentLength: -1, want: false},
+		{name: "gRPC", method: http.MethodPost, contentType: "application/grpc", contentLength: 4, want: false},
+		{name: "gRPC proto", method: http.MethodPost, contentType: "application/grpc+proto", contentLength: 4, want: false},
+		{name: "gRPC JSON", method: http.MethodPost, contentType: "application/grpc+json", contentLength: 4, want: false},
+		{name: "gRPC web", method: http.MethodPost, contentType: "application/grpc-web", contentLength: 4, want: false},
+		{name: "gRPC web text", method: http.MethodPost, contentType: "application/grpc-web-text", contentLength: 4, want: false},
+		{name: "gRPC web mixed case and parameters", method: http.MethodPost, contentType: " Application/GRPC-Web+Proto ; charset=utf-8", contentLength: 4, want: false},
+		{name: "gRPC prefix is conservative", method: http.MethodPost, contentType: "application/grpcish", contentLength: 4, want: false},
+		{name: "WebSocket", method: http.MethodGet, contentLength: 0, connection: "Upgrade", upgrade: "websocket", want: false},
+		{name: "WebSocket mixed case and connection tokens", method: http.MethodGet, contentLength: 0, connection: "keep-alive, UpGrAdE", upgrade: "WebSocket", want: false},
+		{name: "upgrade without connection header", method: http.MethodGet, contentLength: 0, upgrade: "websocket", want: true},
+		{name: "connection upgrade without protocol", method: http.MethodGet, contentLength: 0, connection: "Upgrade", want: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body io.Reader
+			if tc.contentLength != 0 {
+				body = strings.NewReader("body")
+			}
+			req := httptest.NewRequest(tc.method, "https://service.example/", body)
+			req.ContentLength = tc.contentLength
+			req.Header.Set("Content-Type", tc.contentType)
+			req.Header.Set("Connection", tc.connection)
+			req.Header.Set("Upgrade", tc.upgrade)
+
+			require.Equal(t, tc.want, responseRetryEligible(req))
 		})
 	}
 }

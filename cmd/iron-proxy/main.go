@@ -11,6 +11,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	iotel "github.com/ironsh/iron-proxy/internal/otel"
 	"github.com/ironsh/iron-proxy/internal/postgres"
 	"github.com/ironsh/iron-proxy/internal/proxy"
+	"github.com/ironsh/iron-proxy/internal/responseretry"
 	"github.com/ironsh/iron-proxy/internal/transform"
 	"github.com/ironsh/iron-proxy/internal/version"
 
@@ -211,6 +214,20 @@ func main() {
 		)
 	}
 
+	responseRetryHandler, responseRetryStatuses, err := responseRetryHandlerFromEnv(
+		os.Getenv,
+		time.Duration(cfg.Proxy.UpstreamResponseHeaderTimeout),
+		resolver,
+		guard,
+	)
+	if err != nil {
+		logger.Error("initializing response retry handler", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if responseRetryHandler != nil {
+		logger.Info("response retry handler enabled", slog.Any("statuses", responseRetryStatuses))
+	}
+
 	// Initialize proxy.
 	p := proxy.New(proxy.Options{
 		HTTPAddr:                      cfg.Proxy.HTTPListen,
@@ -223,6 +240,7 @@ func main() {
 		Guard:                         guard,
 		MCPPolicy:                     mcpHolder,
 		MCPGateway:                    gatewayHolder,
+		ResponseRetryHandler:          responseRetryHandler,
 		Logger:                        logger,
 		UpstreamResponseHeaderTimeout: time.Duration(cfg.Proxy.UpstreamResponseHeaderTimeout),
 		UpstreamProxy:                 cfg.Proxy.UpstreamProxy.ProxyFunc(),
@@ -718,4 +736,66 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func parseResponseRetryStatuses(value string) ([]int, error) {
+	var statuses []int
+	for _, part := range splitCommaSeparated(value) {
+		status, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid status %q", part)
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, nil
+}
+
+func responseRetryHandlerFromEnv(getenv func(string) string, timeout time.Duration, resolver *net.Resolver, guard *dnsguard.Guard) (*responseretry.Handler, []int, error) {
+	handlerURL := getenv("IRON_RESPONSE_RETRY_HANDLER_URL")
+	if handlerURL == "" {
+		return nil, nil, nil
+	}
+	allowHTTPValue := getenv("IRON_RESPONSE_RETRY_HANDLER_ALLOW_HTTP")
+	if allowHTTPValue == "" {
+		allowHTTPValue = "false"
+	}
+	allowHTTP, err := strconv.ParseBool(allowHTTPValue)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse HTTP allowance: %w", err)
+	}
+	statuses, err := parseResponseRetryStatuses(getenv("IRON_RESPONSE_RETRY_STATUSES"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse statuses: %w", err)
+	}
+	completionHeaders := getenv("IRON_RESPONSE_RETRY_COMPLETION_HEADERS")
+	if completionHeaders == "" {
+		completionHeaders = "Payment-Receipt"
+	}
+	handler, err := responseretry.New(responseretry.Options{
+		AuthorizeEndpoint: handlerURL,
+		CompleteEndpoint:  getenv("IRON_RESPONSE_RETRY_COMPLETE_URL"),
+		Token:             getenv("IRON_RESPONSE_RETRY_HANDLER_TOKEN"),
+		SandboxID:         getenv("IRON_RESPONSE_RETRY_HANDLER_SANDBOX_ID"),
+		Statuses:          statuses,
+		AllowHTTP:         allowHTTP,
+		CompletionHeaders: splitCommaSeparated(completionHeaders),
+		AllowCIDRs:        splitCommaSeparated(getenv("IRON_RESPONSE_RETRY_HANDLER_ALLOW_CIDRS")),
+		Resolver:          resolver,
+		Guard:             guard,
+		ClientTimeout:     timeout,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return handler, statuses, nil
+}
+
+func splitCommaSeparated(value string) []string {
+	var values []string
+	for _, part := range strings.Split(value, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			values = append(values, part)
+		}
+	}
+	return values
 }

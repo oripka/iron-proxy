@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -30,6 +31,109 @@ func mapEnv(m map[string]string) func(string) string {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestParseResponseRetryStatuses(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		want    []int
+		wantErr string
+	}{
+		{name: "multiple", value: "402, 409", want: []int{402, 409}},
+		{name: "empty entries", value: " ,402,, ", want: []int{402}},
+		{name: "empty", value: "", want: nil},
+		{name: "invalid", value: "402,nope", wantErr: `invalid status "nope"`},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := parseResponseRetryStatuses(tc.value)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestSplitCommaSeparated(t *testing.T) {
+	require.Equal(t, []string{"Payment-Receipt", "X-Receipt"}, splitCommaSeparated(" Payment-Receipt, ,X-Receipt "))
+}
+
+func TestResponseRetryHandlerFromEnv(t *testing.T) {
+	base := map[string]string{
+		"IRON_RESPONSE_RETRY_HANDLER_URL":         "http://127.0.0.1/authorize",
+		"IRON_RESPONSE_RETRY_COMPLETE_URL":        "http://127.0.0.1/complete",
+		"IRON_RESPONSE_RETRY_HANDLER_TOKEN":       "handler-token",
+		"IRON_RESPONSE_RETRY_HANDLER_SANDBOX_ID":  "sandbox-1",
+		"IRON_RESPONSE_RETRY_STATUSES":            "402,409",
+		"IRON_RESPONSE_RETRY_COMPLETION_HEADERS":  "X-Receipt",
+		"IRON_RESPONSE_RETRY_HANDLER_ALLOW_CIDRS": "10.43.0.0/16",
+	}
+
+	handler, statuses, err := responseRetryHandlerFromEnv(mapEnv(base), time.Second, nil, nil)
+
+	require.NoError(t, err)
+	require.NotNil(t, handler)
+	require.Equal(t, []int{402, 409}, statuses)
+}
+
+func TestResponseRetryHandlerFromEnvRejectsUnsafeAllowCIDRs(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "missing prefix", value: "10.43.0.1", want: "must use CIDR notation"},
+		{name: "public range", value: "203.0.113.0/24", want: "private address range"},
+		{name: "link local", value: "169.254.0.0/16", want: "private address range"},
+		{name: "AWS IPv6 metadata", value: "fd00::/8", want: "metadata address"},
+		{name: "GCP IPv6 metadata", value: "fd20:ce::/64", want: "metadata address"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{
+				"IRON_RESPONSE_RETRY_HANDLER_URL":         "http://127.0.0.1/authorize",
+				"IRON_RESPONSE_RETRY_COMPLETE_URL":        "http://127.0.0.1/complete",
+				"IRON_RESPONSE_RETRY_HANDLER_TOKEN":       "handler-token",
+				"IRON_RESPONSE_RETRY_HANDLER_SANDBOX_ID":  "sandbox-1",
+				"IRON_RESPONSE_RETRY_STATUSES":            "402",
+				"IRON_RESPONSE_RETRY_HANDLER_ALLOW_CIDRS": tc.value,
+			}
+
+			handler, _, err := responseRetryHandlerFromEnv(mapEnv(env), time.Second, nil, nil)
+
+			require.Nil(t, handler)
+			require.ErrorContains(t, err, tc.want)
+		})
+	}
+}
+
+func TestResponseRetryHandlerFromEnvDisabled(t *testing.T) {
+	handler, statuses, err := responseRetryHandlerFromEnv(mapEnv(nil), time.Second, nil, nil)
+
+	require.NoError(t, err)
+	require.Nil(t, handler)
+	require.Nil(t, statuses)
+}
+
+func TestResponseRetryHandlerFromEnvRequiresDedicatedToken(t *testing.T) {
+	env := map[string]string{
+		"IRON_RESPONSE_RETRY_HANDLER_URL":        "http://127.0.0.1/authorize",
+		"IRON_RESPONSE_RETRY_COMPLETE_URL":       "http://127.0.0.1/complete",
+		"IRON_RESPONSE_RETRY_HANDLER_SANDBOX_ID": "sandbox-1",
+		"IRON_RESPONSE_RETRY_STATUSES":           "402",
+		"IRON_PROXY_TOKEN":                       "control-plane-token",
+	}
+
+	handler, _, err := responseRetryHandlerFromEnv(mapEnv(env), time.Second, nil, nil)
+
+	require.Nil(t, handler)
+	require.ErrorContains(t, err, "handler token is required")
 }
 
 // localListener builds a single-upstream local listener (with its own shared
