@@ -363,3 +363,12 @@ func TestApplyPipelineSync_PreservesAuditFunc(t *testing.T) {
 	holder.Load().EmitAudit(nil)
 	require.True(t, called, "audit func should be carried over to the new pipeline")
 }
+
+// Guard configures interactive_policy; an upstream merge once dropped its
+// registration silently, breaking every guarded run.
+func TestGuardTransformsAreRegistered(t *testing.T) {
+	for _, name := range []string{"allowlist", "interactive_policy", "secrets"} {
+		_, err := transform.Lookup(name)
+		require.NoError(t, err, name)
+	}
+}
