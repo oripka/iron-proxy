@@ -82,9 +82,13 @@ type DNS struct {
 }
 
 // IsEnabled reports whether the DNS server should run. DNS is on unless
-// explicitly disabled.
+// explicitly disabled, either with enabled: false or, as older configs
+// (Guard's among them) do, with listen: "off".
 func (d DNS) IsEnabled() bool {
-	return d.Enabled == nil || *d.Enabled
+	if d.Enabled != nil {
+		return *d.Enabled
+	}
+	return d.Listen == "" || normalizeOptionalListen(d.Listen) != ""
 }
 
 // DNSRecord is a static DNS record entry.
@@ -280,6 +284,12 @@ func applyDefaults(cfg *Config) {
 		cfg.Log.Level = "info"
 	}
 
+	// listen: "off" without an explicit enabled: means DNS is off, as it was
+	// before enabled existed; record that before the address is cleared.
+	if cfg.DNS.Enabled == nil && cfg.DNS.Listen != "" && normalizeOptionalListen(cfg.DNS.Listen) == "" {
+		disabled := false
+		cfg.DNS.Enabled = &disabled
+	}
 	cfg.DNS.Listen = normalizeOptionalListen(cfg.DNS.Listen)
 	cfg.Proxy.HTTPListen = normalizeOptionalListen(cfg.Proxy.HTTPListen)
 	cfg.Proxy.HTTPSListen = normalizeOptionalListen(cfg.Proxy.HTTPSListen)

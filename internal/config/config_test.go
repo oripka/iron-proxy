@@ -634,3 +634,32 @@ tls:
 		require.Contains(t, err.Error(), "control_plane.poll_interval must be positive")
 	})
 }
+
+func TestDNSListenOffDisablesDNS(t *testing.T) {
+	cases := []struct {
+		name    string
+		dns     DNS
+		enabled bool
+	}{
+		{name: "default", dns: DNS{}, enabled: true},
+		{name: "listen off", dns: DNS{Listen: "off"}, enabled: false},
+		{name: "listen address", dns: DNS{Listen: ":53"}, enabled: true},
+		{name: "explicit false wins", dns: DNS{Listen: ":53", Enabled: boolPtr(false)}, enabled: false},
+		{name: "explicit true wins", dns: DNS{Listen: "off", Enabled: boolPtr(true)}, enabled: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.enabled, tc.dns.IsEnabled())
+		})
+	}
+}
+
+func boolPtr(value bool) *bool { return &value }
+
+func TestLoadAcceptsDNSListenOffWithoutProxyIP(t *testing.T) {
+	cfg, err := parse(strings.NewReader("dns:\n  listen: \"off\"\nproxy:\n  http_listen: \"127.0.0.1:0\"\n  https_listen: \"off\"\ntls:\n  ca_cert: a\n  ca_key: b\n"))
+	require.NoError(t, err)
+	applyDefaults(cfg)
+	require.NoError(t, Validate(cfg))
+	require.False(t, cfg.DNS.IsEnabled())
+}
