@@ -2,6 +2,7 @@ package transform
 
 import (
 	"log/slog"
+	"sync/atomic"
 )
 
 // traceEntry is a JSON-serializable representation of a TransformTrace.
@@ -37,6 +38,8 @@ func NewAuditLogger(logger *slog.Logger) AuditFunc {
 				slog.String("action", action),
 				slog.Int("status_code", result.StatusCode),
 				slog.Float64("duration_ms", float64(result.Duration.Microseconds())/1000.0),
+				slog.Int64("bytes_sent", atomic.LoadInt64(&result.RequestBytes)),
+				slog.Int64("bytes_received", result.ResponseBytes),
 			),
 		}
 		if result.Tunnel != nil {

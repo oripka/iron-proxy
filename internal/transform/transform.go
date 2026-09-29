@@ -137,6 +137,13 @@ type PipelineResult struct {
 	Action     TransformAction
 	StatusCode int
 
+	// RequestBytes counts request body bytes forwarded upstream and
+	// ResponseBytes counts response body bytes written to the client.
+	// RequestBytes is updated atomically because the HTTP transport reads
+	// the request body on its own goroutine; read it with atomic.LoadInt64.
+	RequestBytes  int64
+	ResponseBytes int64
+
 	Tunnel *TunnelInfo
 
 	RequestTransforms  []TransformTrace

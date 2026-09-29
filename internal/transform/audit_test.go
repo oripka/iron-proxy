@@ -360,3 +360,21 @@ func TestAudit_BodyCapture_EmptyBodyOmitsGroup(t *testing.T) {
 	_, hasGroup := parsed["body_capture"]
 	require.False(t, hasGroup, "body_capture group should be absent when RequestBody() is empty")
 }
+
+func TestAudit_BodyByteCounts(t *testing.T) {
+	result := &PipelineResult{
+		Host:          "registry.npmjs.org",
+		Method:        "GET",
+		Path:          "/react",
+		Action:        ActionContinue,
+		StatusCode:    200,
+		RequestBytes:  128,
+		ResponseBytes: 4096,
+	}
+
+	parsed, _ := captureAuditLog(result)
+
+	audit := parsed["audit"].(map[string]any)
+	require.Equal(t, float64(128), audit["bytes_sent"])
+	require.Equal(t, float64(4096), audit["bytes_received"])
+}

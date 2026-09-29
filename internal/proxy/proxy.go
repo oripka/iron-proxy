@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ironsh/iron-proxy/internal/certcache"
@@ -411,7 +412,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	if rejectResp != nil {
 		result.Action = transform.ShortCircuitAction(result.RequestTransforms)
 		result.StatusCode = rejectResp.StatusCode
-		p.writeResponse(w, rejectResp)
+		result.ResponseBytes = p.writeResponse(w, rejectResp)
 		return
 	}
 
@@ -440,7 +441,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 			if rejectResp != nil {
 				result.Action = transform.ActionReject
 				result.StatusCode = rejectResp.StatusCode
-				p.writeResponse(w, rejectResp)
+				result.ResponseBytes = p.writeResponse(w, rejectResp)
 				return
 			}
 		}
@@ -501,7 +502,8 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	reqBody := transform.RequireBufferedBody(r.Body)
 	// Check Len() before StreamingReader(), which clears the original reader.
 	reqBodyLen := reqBody.Len()
-	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, io.NopCloser(reqBody.StreamingReader()))
+	upstreamBody := &countingReader{reader: reqBody.StreamingReader(), count: &result.RequestBytes}
+	upstreamReq, err := http.NewRequestWithContext(r.Context(), r.Method, upstreamURL, io.NopCloser(upstreamBody))
 	if err != nil {
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusBadGateway
@@ -648,11 +650,11 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 
 	// SSE: stream with flushing
 	if isSSE(finalResp) {
-		p.streamSSE(w, finalResp)
+		result.ResponseBytes = p.streamSSE(w, finalResp)
 		return
 	}
 
-	p.writeResponse(w, finalResp)
+	result.ResponseBytes = p.writeResponse(w, finalResp)
 }
 
 func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
@@ -985,8 +987,9 @@ func isSSE(resp *http.Response) bool {
 	return strings.HasPrefix(ct, "text/event-stream")
 }
 
-// streamSSE writes an SSE response with per-chunk flushing.
-func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
+// streamSSE writes an SSE response with per-chunk flushing and returns the
+// number of body bytes written to the client.
+func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) int64 {
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
@@ -994,17 +997,21 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		if _, err := io.Copy(w, reader); err != nil {
+		written, err := io.Copy(w, reader)
+		if err != nil {
 			p.logger.Warn("SSE copy error", slog.String("error", err.Error()))
 		}
-		return
+		return written
 	}
 
+	var written int64
 	buf := make([]byte, 32*1024)
 	for {
 		n, readErr := reader.Read(buf)
 		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+			wrote, writeErr := w.Write(buf[:n])
+			written += int64(wrote)
+			if writeErr != nil {
 				p.logger.Warn("SSE write error", slog.String("error", writeErr.Error()))
 				break
 			}
@@ -1017,12 +1024,16 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
 			break
 		}
 	}
+	return written
 }
 
-func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
+// writeResponse writes resp to the client and returns the number of body
+// bytes written.
+func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) int64 {
 	copyHeaders(w.Header(), resp.Header)
 	// Forward upstream trailers (e.g. gRPC status) after the body.
 	defer writeTrailers(w, resp)
+	var body io.Reader
 	if buf, ok := resp.Body.(*transform.BufferedBody); ok {
 		// If a transform buffered the response body, set Content-Length
 		// from the buffered data. Otherwise preserve the upstream header
@@ -1031,19 +1042,35 @@ func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) {
 		if n := buf.Len(); n >= 0 {
 			w.Header().Set("Content-Length", strconv.FormatInt(int64(n), 10))
 		}
-		w.WriteHeader(resp.StatusCode)
-		if _, err := io.Copy(w, buf.StreamingReader()); err != nil {
-			p.logger.Warn("response body copy error", slog.String("error", err.Error()))
-		}
-	} else {
+		body = buf.StreamingReader()
+	} else if resp.Body != nil {
 		// Synthetic responses (e.g. reject) with plain bodies.
-		w.WriteHeader(resp.StatusCode)
-		if resp.Body != nil {
-			if _, err := io.Copy(w, resp.Body); err != nil {
-				p.logger.Warn("response body copy error", slog.String("error", err.Error()))
-			}
-		}
+		body = resp.Body
 	}
+	w.WriteHeader(resp.StatusCode)
+	if body == nil {
+		return 0
+	}
+	written, err := io.Copy(w, body)
+	if err != nil {
+		p.logger.Warn("response body copy error", slog.String("error", err.Error()))
+	}
+	return written
+}
+
+// countingReader adds the bytes read through it to count. It is safe for the
+// HTTP transport to read on its own goroutine while the audit reads count.
+type countingReader struct {
+	reader io.Reader
+	count  *int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.reader.Read(p)
+	if n > 0 {
+		atomic.AddInt64(c.count, int64(n))
+	}
+	return n, err
 }
 
 // buildTransport creates the HTTP transport used for upstream requests.
