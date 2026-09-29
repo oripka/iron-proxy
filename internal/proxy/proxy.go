@@ -451,7 +451,10 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 	if isWebSocketUpgrade(r) {
 		result.Action = transform.ActionContinue
 		result.StatusCode = http.StatusSwitchingProtocols
-		p.handleWebSocket(w, r, scheme, host)
+		if err := p.handleWebSocket(w, r, scheme, host); err != nil {
+			result.StatusCode = http.StatusBadGateway
+			result.Err = err
+		}
 		return
 	}
 
@@ -874,8 +877,10 @@ func sanitizeUpstreamHeaders(h http.Header) {
 }
 
 // handleWebSocket hijacks the client connection and proxies raw bytes
-// bidirectionally to the upstream WebSocket server.
-func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, host string) {
+// bidirectionally to the upstream WebSocket server. It returns an error when
+// the upstream handshake could not be started (after writing a 502), so the
+// caller can record it on the audit entry.
+func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, host string) error {
 	// Dial the upstream
 	upstreamScheme := "ws"
 	if scheme == "https" {
@@ -914,7 +919,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 			slog.String("error", err.Error()),
 		)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
+		return fmt.Errorf("websocket upstream dial: %w", err)
 	}
 
 	// Sanitize the inbound request headers before serializing the upgrade
@@ -930,7 +935,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 		p.logger.Error("websocket upstream write failed", slog.String("error", writeErr.Error()))
 		upstreamConn.Close()
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		return
+		return fmt.Errorf("websocket upstream write: %w", writeErr)
 	}
 
 	// Hijack the client connection
@@ -939,13 +944,13 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 		p.logger.Error("websocket hijack not supported")
 		upstreamConn.Close()
 		http.Error(w, "websocket not supported", http.StatusInternalServerError)
-		return
+		return errors.New("websocket hijack not supported")
 	}
 	clientConn, clientBuf, err := hj.Hijack()
 	if err != nil {
 		p.logger.Error("websocket hijack failed", slog.String("error", err.Error()))
 		upstreamConn.Close()
-		return
+		return fmt.Errorf("websocket hijack: %w", err)
 	}
 
 	// Proxy bidirectionally
@@ -979,6 +984,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request, scheme, 
 	upstreamConn.Close()
 
 	p.logger.Debug("websocket connection closed", slog.String("host", host))
+	return nil
 }
 
 // isSSE detects a Server-Sent Events response.

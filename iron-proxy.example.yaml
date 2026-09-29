@@ -588,6 +588,48 @@ transforms:
   #         methods: ["POST"]
   #         paths: ["/v1/messages"]
 
+  # Interactive policy: allows configured rules and asks an external local
+  # decision service about misses. A deny decision may return a custom
+  # {status, content_type, body}. Requests to control_hosts are never dialed
+  # upstream; they are answered by control_endpoint (plain HTTP, or HTTPS via
+  # CONNECT/SOCKS5 in MITM mode; rejected with 400 in sni-only mode).
+  # - name: interactive_policy
+  #   config:
+  #     endpoint: "http://127.0.0.1:17891/decision"
+  #     timeout_ms: 300000
+  #     control_hosts: ["nosy.policy"]
+  #     control_endpoint: "http://127.0.0.1:17891/control"
+  #     rules:
+  #       - host: "api.openai.com"
+  #         methods: ["POST"]
+  #         paths: ["/v1/*"]
+
+  # L7 policy: protocol-aware rules for requests matching host/cidr, methods,
+  # and paths. Out-of-scope requests pass unchanged; every matching rule must
+  # pass (deny beats allow). Requires MITM: in sni-only mode in-scope hosts are
+  # denied as "uninspected". Bodies over max_request_body_bytes are denied.
+  # - name: l7_policy
+  #   config:
+  #     rules:
+  #       - host: "api.github.com"
+  #         paths: ["/graphql"]
+  #         protocol: graphql
+  #         graphql:
+  #           operations: ["query"]       # query|mutation|subscription; empty = all
+  #           allow_names: []             # exact or trailing *
+  #           deny_names: []
+  #       - host: "rpc.example.com"
+  #         methods: ["POST"]
+  #         protocol: jsonrpc
+  #         jsonrpc:
+  #           allow_methods: ["eth_call", "eth_get*"]
+  #           deny_methods: []
+  #       - host: "ws.example.com"
+  #         paths: ["/socket"]
+  #         protocol: websocket
+  #         websocket:
+  #           allow: true                 # permit Upgrade: websocket handshakes
+
   # gRPC transforms: each entry delegates to one external TransformService server.
   # Use multiple entries for multiple servers; they run in pipeline order.
   - name: grpc

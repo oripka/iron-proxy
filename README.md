@@ -213,6 +213,7 @@ Transforms run in order. Built-in transforms:
 | ----------- | ----------------------------------------------------------------------------------------------------------------------- |
 | `allowlist`    | Permits requests to matching domains/CIDRs; rejects everything else (403).                                              |
 | `interactive_policy` | Permits configured host/method/path rules and delegates misses to an external local policy service.    |
+| `l7_policy`    | Enforces GraphQL operation, JSON-RPC method, and WebSocket upgrade rules on in-scope requests (403 on violation). |
 | `secrets`      | Scans headers (and optionally query, path, or body) for proxy tokens and swaps in real secrets from environment variables. |
 | `body_capture` | Records decoded request bodies of matching hosts as `request_body` audit fields. Observation-only; never rejects.       |
 
@@ -346,6 +347,108 @@ transforms:
           methods: ["POST"]
           paths: ["/v1/responses", "/v1/oripka/*"]
 ```
+
+The decision request carries `host`, `method`, `path`, `url` (query
+stripped), `sni`, `headers` (without `Authorization`, `Cookie`, and
+`Proxy-Authorization`), `client_addr` (the downstream client socket, e.g.
+`127.0.0.1:53122`, on forward-proxy, CONNECT, SOCKS5, and inner MITM
+requests alike), `mode` (`mitm` or `sni-only`, i.e. whether the request was
+inspected), and `tunnel` (the CONNECT/SOCKS5 target for requests inside a
+tunnel). A deny decision may carry a custom response:
+
+```json
+{"action": "deny", "reason": "not approved", "status": 403,
+ "content_type": "text/plain; charset=utf-8", "body": "Blocked by policy\n"}
+```
+
+When `body` is non-empty the client receives it with `status` (default 403)
+and `content_type` (default `text/plain; charset=utf-8`); otherwise the
+standard 403 is returned. Audit annotations are unchanged.
+
+**Control hosts.** Requests whose host (port stripped) exactly matches an
+entry in `control_hosts` are never dialed upstream. The proxy POSTs
+`{method, host, path, query, headers, body, client_addr}` to
+`control_endpoint` and returns the service's `{status, content_type, body}`
+to the client as a stub (`status` defaults to 200 and must be 200–599). Bodies
+over 64 KiB, or truncated by `proxy.max_request_body_bytes`, get 413. A failed
+or invalid control response yields 502. The trace records
+`decision: "control"`. CONNECT/SOCKS5 tunnels to a control host are admitted
+in MITM mode so the inner HTTPS or HTTP request can be answered; in `sni-only`
+mode, where a tunnel would be passed through, they are rejected with 400.
+Control hosts are handled only once a request reaches `interactive_policy`, so
+place it before transforms that reject unknown hosts.
+
+```yaml
+transforms:
+  - name: interactive_policy
+    config:
+      endpoint: "http://127.0.0.1:17891/decision"
+      control_hosts: ["nosy.policy"]
+      control_endpoint: "http://127.0.0.1:17891/control"
+```
+
+### L7 policy
+
+`l7_policy` applies protocol-aware rules to GraphQL, JSON-RPC, and WebSocket
+traffic. Each rule uses the usual `host`/`cidr`, `methods`, and `paths` fields
+to define its scope. Requests that match no rule pass through unchanged. For a
+request that matches, every matching rule must pass, and a deny list always
+takes precedence over an allow list. Name patterns are exact names or end in
+a single `*`.
+
+- **graphql:** Reads `{query, operationName}` from a POST JSON body. Batched
+  arrays are supported, and every element must pass. The transform also reads
+  an `application/graphql` body or GET `?query=`. It lexes the document to
+  find the executed operation's type (`query`, `mutation`, `subscription`; the
+  `{...}` shorthand is a query) and its name. `operations` limits the allowed
+  types, where empty means all. `allow_names` and `deny_names` filter
+  operation names. The request is denied if the body is unparseable, if a
+  multi-operation document has no `operationName`, if a JSON key is
+  duplicated, or if `query`/`operationName` appears in both the URL and the
+  body.
+- **jsonrpc:** POST JSON body, single or batch. Every `method` must match
+  `allow_methods` (when non-empty) and must not match `deny_methods`. Non
+  JSON-RPC bodies and other HTTP methods are denied. Add `methods: ["POST"]`
+  to the rule to leave other methods out of scope.
+- **websocket:** A request carrying `Upgrade: websocket` is allowed only if
+  `allow: true`. Plain requests in scope are unaffected. WebSocket upgrades
+  are also unaffected by `graphql` and `jsonrpc` rules, so add a `websocket`
+  rule for the same scope to govern GraphQL-over-WebSocket.
+
+Rejections return 403 with a short `l7_policy: ...` text body. The trace
+records `protocol` and `reason`, along with `operation_type`/`operation_name`
+or `method` (plural lists for batches). No other body content is recorded.
+When a body in scope exceeds `proxy.max_request_body_bytes`, the reason is
+`oversize_body`. The transform requires MITM. In `sni-only` mode, any request
+whose host matches a rule is denied as `uninspected`. Path patterns match
+`req.URL.Path` literally, so use `"/graphql*"` or `"/graphql/*"` to cover
+trailing-slash variants.
+
+```yaml
+transforms:
+  - name: l7_policy
+    config:
+      rules:
+        - host: "api.github.com"
+          paths: ["/graphql"]
+          protocol: graphql
+          graphql:
+            operations: ["query"]
+            allow_names: []
+            deny_names: []
+        - host: "rpc.example.com"
+          methods: ["POST"]
+          protocol: jsonrpc
+          jsonrpc:
+            allow_methods: ["eth_call", "eth_get*"]
+            deny_methods: []
+        - host: "ws.example.com"
+          paths: ["/socket"]
+          protocol: websocket
+          websocket:
+            allow: true
+```
+
 
 ### Annotate
 

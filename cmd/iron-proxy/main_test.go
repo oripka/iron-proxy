@@ -367,7 +367,7 @@ func TestApplyPipelineSync_PreservesAuditFunc(t *testing.T) {
 // Guard configures interactive_policy; an upstream merge once dropped its
 // registration silently, breaking every guarded run.
 func TestGuardTransformsAreRegistered(t *testing.T) {
-	for _, name := range []string{"allowlist", "interactive_policy", "secrets"} {
+	for _, name := range []string{"allowlist", "interactive_policy", "l7_policy", "secrets"} {
 		_, err := transform.Lookup(name)
 		require.NoError(t, err, name)
 	}

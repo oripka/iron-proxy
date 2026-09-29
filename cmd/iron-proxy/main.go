@@ -44,6 +44,7 @@ import (
 	_ "github.com/ironsh/iron-proxy/internal/transform/hmacsign"
 	_ "github.com/ironsh/iron-proxy/internal/transform/interactivepolicy"
 	_ "github.com/ironsh/iron-proxy/internal/transform/judge"
+	_ "github.com/ironsh/iron-proxy/internal/transform/l7policy"
 	_ "github.com/ironsh/iron-proxy/internal/transform/oauth"
 	_ "github.com/ironsh/iron-proxy/internal/transform/secrets"
 )
