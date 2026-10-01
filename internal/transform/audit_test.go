@@ -378,3 +378,17 @@ func TestAudit_BodyByteCounts(t *testing.T) {
 	require.Equal(t, float64(128), audit["bytes_sent"])
 	require.Equal(t, float64(4096), audit["bytes_received"])
 }
+
+func TestAuditNativeProvenancePreservesRequestVerdict(t *testing.T) {
+	result := &PipelineResult{Host: "example.test", Method: "POST", Path: "/blocked", Action: ActionReject, StatusCode: 403,
+		Tunnel:            &TunnelInfo{Target: "192.0.2.1:443", Native: &NativeFlowInfo{FlowID: "provider:flow", PolicyRevision: "revision", InspectionSession: "session", RequestID: "request-2"}},
+		RequestTransforms: []TransformTrace{{Name: "interactive_policy", Action: ActionReject, Annotations: map[string]any{"rule_id": "rule-1", "reason": "httpRules-default-deny"}}}}
+	parsed, raw := captureAuditLog(result)
+	native := parsed["native"].(map[string]any)
+	require.Equal(t, "provider:flow", native["flow_id"])
+	require.Equal(t, "request-2", native["request_id"])
+	require.Equal(t, "revision", native["policy_revision"])
+	require.Equal(t, "reject", parsed["audit"].(map[string]any)["action"])
+	require.Equal(t, "interactive_policy", parsed["rejected_by"])
+	require.NotContains(t, raw, "Proxy-Authorization")
+}

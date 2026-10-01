@@ -1195,3 +1195,64 @@ To verify a specific binary against the signed checksum list (example: `iron-pro
 ```bash
 shasum -a 256 iron-proxy-linux-amd64 | grep -F "$(grep -F 'iron-proxy-linux-amd64' checksums.txt | awk '{print $1}')"
 ```
+
+
+### Nosy native inspection (local fork preview)
+
+`--nosy-inspection` selects a dedicated loopback CONNECT listener for Nosy's
+opt-in native firewall inspection. It requires a 64-hex-character
+`NOSY_INSPECTION_TOKEN`, a CA, and disabled HTTPS/tunnel listeners. The native
+provider supplies `Proxy-Authorization: Bearer ...`, a process-instance hash in
+`X-Nosy-App`, and `X-PacketSafari-Flow-ID`. Only literal IP:443 endpoints are
+accepted. Native firewall admission precedes forwarding; every upstream dial
+remains pinned to that IP/port and passes the existing upstream IP guard. Both
+CONNECT and decrypted HTTP pass the transform pipeline. Authentication values
+are removed before audit/pipeline processing. Do not expose this listener or
+its token to untrusted clients: the token authorizes native admitted endpoints.
+
+On client certificate rejection, a bounded ten-minute process/IP/port/SNI cache
+allows the next attempt to tunnel unchanged TLS. The first attempt may fail;
+requests are never replayed. `--nosy-inspection-fail-closed` instead denies those
+retries. HTTP upgrades are unsupported and train the same subsequent fallback;
+missing SNI and other handshake/upstream failures do not. This path must not be
+used for secret-injection or mandatory HTTP-policy workloads: fail-open
+intentionally forfeits HTTP inspection on these narrowly cached connections.
+
+One listener limits active tunnels and concurrent HTTP requests to 512 each;
+pre-handshake HTTP sockets are separately limited to 512. The compatibility
+cache holds at most 4,096 entries. Structured `native_inspection` records contain
+only flow identity and outcome; normal per-request audit remains enabled.
+`--nosy-inspection-version` prints `1` for bundle compatibility. This development
+preview has local TLS/fallback tests; signed macOS provider behavior and sustained
+load are separate qualification requirements. Default proxy modes are unchanged.
+
+
+#### Nosyd provenance contract v2
+
+`--nosy-inspection-contract-version` prints `2`. Start with `--nosy-inspection`
+and `--nosy-inspection-provenance` for the daemon-owned integration. This mode
+requires an `interactive_policy` gate followed only by optional `l7_policy`
+transforms; managed mode and secret injection are refused. It always fails closed,
+including certificate rejection, missing SNI and unsupported upgrades. The legacy
+version-1 compatibility mode above remains separate.
+
+In addition to the bearer, app hash and flow ID, v2 CONNECT requires
+`X-Nosy-Inspection-Version: 2`, `X-Nosy-Policy-Revision` and
+`X-Nosy-Inspection-Session`. Missing provenance cannot downgrade the listener.
+Nosyd supplies the credential only to its owned engine and the authenticated
+native provider. These headers are removed before policy/audit processing and
+upstream forwarding. The passive ClientHello's SNI receives the CONNECT policy
+check before any upstream dial; the original literal IP/port remains pinned.
+Each decrypted request independently passes HTTP and L7 policy.
+
+JSON and OTEL request audits include a `native` object containing `flow_id`,
+`policy_revision`, `inspection_session` and a distinct `request_id`. Native
+inspection records carry the same session/revision. Additional response-only
+records cover early exits but do not infer policy decisions from status codes.
+Nosyd joins owned-pipe reports to retained provider flow/revision evidence;
+engine-reported decryption is not packet verification.
+
+Disable auxiliary listeners with `proxy.tunnel_listen: ""` and
+`management.listen: ""`; `"off"` is not valid for those two fields. This is a
+source integration with local TLS/policy/provenance tests. Signed macOS redirected
+traffic and sustained load still require candidate-bound acceptance.

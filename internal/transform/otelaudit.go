@@ -53,6 +53,14 @@ func NewOTELAuditFunc(provider *sdklog.LoggerProvider) AuditFunc {
 			log.Float64("duration_ms", float64(result.Duration.Microseconds())/1000.0),
 		}
 
+		if result.Tunnel != nil && result.Tunnel.Native != nil {
+			native := result.Tunnel.Native
+			attrs = append(attrs, log.KeyValue{Key: "native", Value: log.MapValue(
+				log.String("flow_id", native.FlowID), log.String("policy_revision", native.PolicyRevision),
+				log.String("inspection_session", native.InspectionSession), log.String("request_id", native.RequestID),
+			)})
+		}
+
 		if result.Action == ActionReject {
 			for _, tr := range result.RequestTransforms {
 				if tr.Action == ActionReject {

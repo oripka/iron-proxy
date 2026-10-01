@@ -444,11 +444,17 @@ func cloneTunnelInfo(info *transform.TunnelInfo) *transform.TunnelInfo {
 	if info == nil {
 		return nil
 	}
+	var native *transform.NativeFlowInfo
+	if info.Native != nil {
+		copy := *info.Native
+		native = &copy
+	}
 	traces := slices.Clone(info.RequestTransforms)
 	for i := range traces {
 		traces[i].Annotations = maps.Clone(traces[i].Annotations)
 	}
 	return &transform.TunnelInfo{
+		Native:            native,
 		Target:            info.Target,
 		RequestTransforms: traces,
 	}

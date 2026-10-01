@@ -95,7 +95,17 @@ type TransformContext struct {
 
 // TunnelInfo carries metadata from the CONNECT/SOCKS5 tunnel that established
 // an inner request.
+type NativeFlowInfo struct {
+	FlowID            string
+	PolicyRevision    string
+	InspectionSession string
+	RequestID         string
+}
+
 type TunnelInfo struct {
+	// Set only by the authenticated native listener, never from inner headers.
+	Native *NativeFlowInfo
+
 	// Target is the host:port from the CONNECT request or SOCKS5 target.
 	Target string
 

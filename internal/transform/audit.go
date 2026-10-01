@@ -43,6 +43,9 @@ func NewAuditLogger(logger *slog.Logger) AuditFunc {
 			),
 		}
 		if result.Tunnel != nil {
+			if native := result.Tunnel.Native; native != nil {
+				attrs = append(attrs, slog.Group("native", slog.String("flow_id", native.FlowID), slog.String("policy_revision", native.PolicyRevision), slog.String("inspection_session", native.InspectionSession), slog.String("request_id", native.RequestID)))
+			}
 			tunnelAttrs := []any{slog.String("target", result.Tunnel.Target)}
 			if len(result.Tunnel.RequestTransforms) > 0 {
 				tunnelAttrs = append(tunnelAttrs,
