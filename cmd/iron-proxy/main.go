@@ -52,6 +52,9 @@ import (
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "--nosy-inspection-version":
+			fmt.Println("1")
+			return
 		case "generate-ca":
 			runGenerateCA(os.Args[2:])
 			return
@@ -63,6 +66,8 @@ func main() {
 
 	configPath := flag.String("config", "", "path to iron-proxy YAML config file")
 	tokenFlag := flag.String("token", "", "control plane bearer token (managed mode)")
+	nativeInspection := flag.Bool("nosy-inspection", false, "authenticated native firewall inspection listener")
+	nativeFailClosed := flag.Bool("nosy-inspection-fail-closed", false, "deny subsequent connections after certificate rejection")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -89,6 +94,12 @@ func main() {
 
 	// Managed mode is determined by the presence of a control plane token.
 	managed := proxyToken != ""
+	// Compatibility fallback cannot enforce decrypted transforms. Keep this
+	// dedicated mode separate from secret injection and managed workloads.
+	if *nativeInspection && (managed || len(cfg.Transforms) != 1 || cfg.Transforms[0].Name != "allowlist") {
+		fmt.Fprintln(os.Stderr, "native inspection requires a standalone allowlist-only pipeline")
+		os.Exit(1)
+	}
 
 	// Standalone mode serves /v1/reload, which re-reads the config file.
 	// Managed mode serves /v1/status and /v1/sync instead: the control plane
@@ -251,6 +262,13 @@ func main() {
 		// requests through with placeholder credentials intact.
 		Ready: managedReady(poller),
 	})
+
+	if *nativeInspection {
+		if err := p.EnableNativeInspection(os.Getenv("NOSY_INSPECTION_TOKEN"), *nativeFailClosed); err != nil {
+			logger.Error("native inspection unavailable", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+	}
 
 	// Initialize metrics server.
 	metricsServer := metrics.New(cfg.Metrics.Listen, logger)

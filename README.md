@@ -1195,3 +1195,35 @@ To verify a specific binary against the signed checksum list (example: `iron-pro
 ```bash
 shasum -a 256 iron-proxy-linux-amd64 | grep -F "$(grep -F 'iron-proxy-linux-amd64' checksums.txt | awk '{print $1}')"
 ```
+
+
+### Nosy native inspection (local fork preview)
+
+`--nosy-inspection` selects a dedicated loopback CONNECT listener for Nosy's
+opt-in native firewall inspection. It requires a standalone allowlist-only pipeline (managed mode and credential
+transforms are rejected), a 64-hex-character
+`NOSY_INSPECTION_TOKEN`, a CA, and disabled HTTPS/tunnel listeners. The native
+provider supplies `Proxy-Authorization: Bearer ...`, a process-instance hash in
+`X-Nosy-App`, and `X-PacketSafari-Flow-ID`. Only literal IP:443 endpoints are
+accepted. Native firewall admission precedes forwarding; every upstream dial
+remains pinned to that IP/port and passes the existing upstream IP guard. Both
+CONNECT and decrypted HTTP pass the transform pipeline. Authentication values
+are removed before audit/pipeline processing. Do not expose this listener or
+its token to untrusted clients: the token authorizes native admitted endpoints.
+
+On client certificate rejection, a bounded ten-minute process/IP/port/SNI cache
+allows the next attempt to tunnel unchanged TLS. The first attempt may fail;
+requests are never replayed. `--nosy-inspection-fail-closed` instead denies those
+retries. HTTP upgrades are unsupported and train the same subsequent fallback;
+a valid TLS ClientHello without SNI tunnels only in fail-open mode. Other
+handshake/upstream failures do not train fallback. This path must not be
+used for secret-injection or mandatory HTTP-policy workloads: fail-open
+intentionally forfeits HTTP inspection on these narrowly cached connections.
+
+One listener limits active tunnels and concurrent HTTP requests to 512 each;
+pre-handshake HTTP sockets are separately limited to 512. The compatibility
+cache holds at most 4,096 entries. Structured `native_inspection` records contain
+only flow identity and outcome; normal per-request audit remains enabled.
+`--nosy-inspection-version` prints `1` for bundle compatibility. This development
+preview has local TLS/fallback tests; signed macOS provider behavior and sustained
+load are separate qualification requirements. Default proxy modes are unchanged.
