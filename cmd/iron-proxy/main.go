@@ -55,6 +55,9 @@ func main() {
 		case "--nosy-inspection-contract-version":
 			fmt.Println("2")
 			return
+		case "--nosy-browser-privacy-version":
+			fmt.Println("1")
+			return
 		case "--nosy-inspection-version":
 			fmt.Println("1")
 			return
@@ -70,6 +73,7 @@ func main() {
 	configPath := flag.String("config", "", "path to iron-proxy YAML config file")
 	tokenFlag := flag.String("token", "", "control plane bearer token (managed mode)")
 	nativeProvenance := flag.Bool("nosy-inspection-provenance", false, "require native inspection v2 provenance and fail-closed HTTP policy")
+	browserPrivacy := flag.Bool("nosy-browser-privacy", false, "observe bounded outbound vendor request categories without recording values")
 	nativeInspection := flag.Bool("nosy-inspection", false, "authenticated native firewall inspection listener")
 	nativeFailClosed := flag.Bool("nosy-inspection-fail-closed", false, "deny subsequent connections after certificate rejection")
 	flag.Parse()
@@ -100,6 +104,10 @@ func main() {
 	managed := proxyToken != ""
 	// Compatibility fallback cannot enforce decrypted transforms. Keep this
 	// dedicated mode separate from secret injection and managed workloads.
+	if *browserPrivacy && (!*nativeInspection || *nativeProvenance) {
+		fmt.Fprintln(os.Stderr, "browser privacy requires the standalone native compatibility listener")
+		os.Exit(1)
+	}
 	if *nativeProvenance && !*nativeInspection {
 		fmt.Fprintln(os.Stderr, "native provenance requires inspection mode")
 		os.Exit(1)
@@ -281,6 +289,9 @@ func main() {
 	})
 
 	if *nativeInspection {
+		if *browserPrivacy {
+			p.EnableBrowserPrivacy()
+		}
 		var inspectionError error
 		if *nativeProvenance {
 			inspectionError = p.EnableNativeInspectionV2(os.Getenv("NOSY_INSPECTION_TOKEN"))

@@ -1257,3 +1257,26 @@ Disable auxiliary listeners with `proxy.tunnel_listen: ""` and
 `management.listen: ""`; `"off"` is not valid for those two fields. This is a
 source integration with local TLS/policy/provenance tests. Signed macOS redirected
 traffic and sustained load still require candidate-bound acceptance.
+
+#### Bounded browser privacy summaries
+
+`--nosy-browser-privacy` is optional and requires the standalone native
+compatibility listener. `--nosy-browser-privacy-version` prints `1`. It observes
+outgoing requests to known Google, Mozilla, Apple, Microsoft and Brave domain
+families. The host app performs browser attribution using the authenticated
+native flow ID; the engine does not trust User-Agent for attribution.
+
+The observer checks bounded query values, referrer presence, and at most 64 KiB
+of uncompressed JSON/form upload bytes as the normal transport consumes them.
+It never scans responses or pre-reads uploads. Unsupported, compressed, large,
+malformed and incomplete bodies retain explicit coverage states. JSON traversal
+is limited to 4,096 values/16 levels; form parsing to fewer than 1,024 fields.
+Completed uploads release captured bytes and emit their summary without waiting
+for response completion. Declared oversized uploads are never captured.
+
+`browser_privacy` records contain flow/request IDs, requested vendor hostname,
+fixed disclosure categories and coverage only: never values, arbitrary field
+names or bodies. They describe observation, not remote receipt, browser intent,
+or proof a URL was visited. Existing request auditing and policy gates remain
+unchanged. The observer is off in ordinary and daemon v2 modes. Real-browser and
+signed-host qualification is separate from the local tests.

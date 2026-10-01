@@ -266,6 +266,26 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 				return
 			}
 			requestID := fmt.Sprintf("%s:%d", flow, requestSequence.Add(1))
+			privacyHost := inner.Host
+			if host, _, err := net.SplitHostPort(privacyHost); err == nil {
+				privacyHost = host
+			}
+			if p.browserPrivacy && privacyVendor(privacyHost) {
+				finish := observePrivacy(inner)
+				var once sync.Once
+				emit := func() {
+					once.Do(func() {
+						p.logger.Info("browser_privacy", slog.String("flow_id", flow), slog.String("request_id", requestID),
+							slog.String("host", strings.TrimSuffix(strings.ToLower(privacyHost), ".")), slog.Any("summary", finish()))
+					})
+				}
+				if body, ok := inner.Body.(*privacyBody); ok {
+					body.onComplete = emit
+				} else {
+					emit()
+				}
+				defer emit()
+			}
 			observed := &nativeResponseWriter{ResponseWriter: w, status: 200}
 			defer func() {
 				outcome := "response-only" // HTTP status alone is not a policy verdict.

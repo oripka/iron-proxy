@@ -36,6 +36,7 @@ import (
 // listener peeks the SNI from the ClientHello and TCP-passthroughs to the
 // upstream without terminating TLS.
 type Proxy struct {
+	browserPrivacy       bool
 	httpServer           *http.Server
 	httpsServer          *http.Server
 	httpsAddr            string
