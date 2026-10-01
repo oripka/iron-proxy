@@ -37,6 +37,7 @@ func nativeFixture(t *testing.T, strict bool, v2 ...bool) (*Proxy, string, strin
 	require.NoError(t, err)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	pipeline := transform.NewPipeline([]transform.Transformer{allow}, transform.BodyLimits{}, logger)
+	pipeline.SetAuditFunc(transform.NewAuditLogger(logger))
 	p := New(Options{HTTPAddr: "127.0.0.1:0", CertCache: cache, Pipeline: transform.NewPipelineHolder(pipeline), Logger: logger})
 	p.transport.TLSClientConfig.RootCAs = upstreamPool
 	_, port, err := net.SplitHostPort(target)
