@@ -17,12 +17,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func nativeFixture(t *testing.T, strict bool) (*Proxy, string, string, *x509.CertPool, *x509.CertPool) {
+func nativeFixture(t *testing.T, strict bool, v2 ...bool) (*Proxy, string, string, *x509.CertPool, *x509.CertPool) {
 	t.Helper()
 	target, upstreamPool := startEchoTLSServer(t)
 	ca, key := generateTestCA(t)
@@ -38,7 +41,7 @@ func nativeFixture(t *testing.T, strict bool) (*Proxy, string, string, *x509.Cer
 	p.transport.TLSClientConfig.RootCAs = upstreamPool
 	_, port, err := net.SplitHostPort(target)
 	require.NoError(t, err)
-	require.NoError(t, p.enableNativeInspection(strings.Repeat("a", 64), strict, port))
+	require.NoError(t, p.enableNativeInspection(strings.Repeat("a", 64), strict, port, v2...))
 	server := httptest.NewServer(p.httpServer.Handler)
 	t.Cleanup(func() { p.shutdownCancel(); server.Close(); p.transport.CloseIdleConnections() })
 	return p, server.Listener.Addr().String(), target, pool, upstreamPool
@@ -268,4 +271,82 @@ func TestNativeInspectionV2GatesSNIAndInnerRequests(t *testing.T) {
 	require.Error(t, err, "SNI admission must deny before upstream dial")
 	_, err = nativeConnectVersion(t, addr, target, strings.Repeat("b", 64), pool, "127.0.0.1", nativeV2Headers)
 	require.Error(t, err, "v2 requires SNI rather than opaque forwarding")
+}
+
+// Exercises simultaneous TLS tunnels and repeated HTTP requests, not just a
+// synthetic cache loop. Timing is recorded, never treated as a release SLA.
+func TestNativeInspectionConcurrentKeepAlive(t *testing.T) {
+	for _, v2 := range []bool{false, true} {
+		for _, workers := range []int{16, 64, 128} {
+			for _, h2 := range []bool{false, true} {
+				t.Run(fmt.Sprintf("v2=%t/connections=%d/h2=%t", v2, workers, h2), func(t *testing.T) {
+					_, addr, target, pool, _ := nativeFixture(t, v2, v2)
+					proxyURL, err := url.Parse("http://" + addr)
+					require.NoError(t, err)
+					const requests = 32
+					errors := make(chan error, workers)
+					runtime.GC()
+					var before, after runtime.MemStats
+					runtime.ReadMemStats(&before)
+					start := time.Now()
+					var wg sync.WaitGroup
+					for i := 0; i < workers; i++ {
+						wg.Add(1)
+						go func(i int) {
+							defer wg.Done()
+							transport := &http.Transport{ForceAttemptHTTP2: h2, Proxy: http.ProxyURL(proxyURL), TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "localhost"},
+								ProxyConnectHeader: http.Header{"Proxy-Authorization": {"Bearer " + strings.Repeat("a", 64)}, "X-Nosy-App": {fmt.Sprintf("%064x", i)}, "X-Packetsafari-Flow-Id": {fmt.Sprintf("load:%d", i)}}}
+							if v2 {
+								transport.ProxyConnectHeader.Set("X-Nosy-Inspection-Version", "2")
+								transport.ProxyConnectHeader.Set("X-Nosy-Policy-Revision", "load-revision")
+								transport.ProxyConnectHeader.Set("X-Nosy-Inspection-Session", "load-session")
+							}
+							defer transport.CloseIdleConnections()
+							client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+							for j := 0; j < requests; j++ {
+								req, err := http.NewRequest("GET", "https://"+target+"/load", nil)
+								if err != nil {
+									errors <- err
+									return
+								}
+								req.Host = "localhost"
+								res, err := client.Do(req)
+								if err != nil {
+									errors <- err
+									return
+								}
+								_, readErr := io.Copy(io.Discard, res.Body)
+								closeErr := res.Body.Close()
+								if readErr != nil {
+									errors <- readErr
+									return
+								}
+								if closeErr != nil {
+									errors <- closeErr
+									return
+								}
+								if h2 && res.ProtoMajor != 2 {
+									errors <- fmt.Errorf("HTTP/2 not negotiated")
+									return
+								}
+								if res.StatusCode != 200 {
+									errors <- fmt.Errorf("unexpected status %d", res.StatusCode)
+									return
+								}
+							}
+						}(i)
+					}
+					wg.Wait()
+					close(errors)
+					for err := range errors {
+						require.NoError(t, err)
+					}
+					elapsed := time.Since(start)
+					runtime.GC()
+					runtime.ReadMemStats(&after)
+					t.Logf("%d simultaneous tunnels, %d requests: %s; %.0f requests/s; allocated %.1f MiB; retained heap delta %.1f MiB", workers, workers*requests, elapsed, float64(workers*requests)/elapsed.Seconds(), float64(after.TotalAlloc-before.TotalAlloc)/(1<<20), float64(int64(after.HeapAlloc)-int64(before.HeapAlloc))/(1<<20))
+				})
+			}
+		}
+	}
 }

@@ -1214,7 +1214,8 @@ On client certificate rejection, a bounded ten-minute process/IP/port/SNI cache
 allows the next attempt to tunnel unchanged TLS. The first attempt may fail;
 requests are never replayed. `--nosy-inspection-fail-closed` instead denies those
 retries. HTTP upgrades are unsupported and train the same subsequent fallback;
-missing SNI and other handshake/upstream failures do not. This path must not be
+a valid ClientHello without SNI tunnels only in legacy fail-open mode. Other
+handshake/upstream failures do not train fallback. This path must not be
 used for secret-injection or mandatory HTTP-policy workloads: fail-open
 intentionally forfeits HTTP inspection on these narrowly cached connections.
 
