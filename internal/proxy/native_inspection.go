@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -260,6 +261,8 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 			return
 		}
 		defer tlsConn.Close()
+		reportTLS := nativeTLSReporter(p.logger, flow, revision, session)
+		reportTLS("client", tlsConn.ConnectionState())
 		// Each active tunnel owns one small transport, reusing upstream connections
 		// for its HTTP/1 keep-alives and HTTP/2 streams. No cross-app connection pool.
 		transport := p.transport.Clone()
@@ -335,6 +338,12 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 				requestInfo = &transform.TunnelInfo{Target: r.Host}
 			}
 			requestInfo.Native = &transform.NativeFlowInfo{FlowID: flow, PolicyRevision: revision, InspectionSession: session, RequestID: requestID}
+			trace := &httptrace.ClientTrace{TLSHandshakeDone: func(state tls.ConnectionState, err error) {
+				if err == nil {
+					reportTLS("upstream", state)
+				}
+			}}
+			inner = inner.WithContext(httptrace.WithClientTrace(inner.Context(), trace))
 			scoped.handleHTTP(w, inner, requestInfo)
 		})); err != nil {
 			p.logger.Debug("native inspection connection ended", slog.String("flow_id", flow))
