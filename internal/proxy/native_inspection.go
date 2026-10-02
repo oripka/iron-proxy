@@ -24,6 +24,7 @@ import (
 )
 
 type nativeInspection struct {
+	capture    nativeCapture
 	token      string
 	failClosed bool
 	slots      chan struct{}
@@ -69,6 +70,11 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 		return fmt.Errorf("invalid native inspection token")
 	}
 	state := &nativeInspection{token: token, failClosed: failClosed, slots: make(chan struct{}, 512), failures: make(map[string]time.Time)}
+	context.AfterFunc(p.shutdownCtx, func() {
+		state.capture.mu.Lock()
+		defer state.capture.mu.Unlock()
+		state.capture.clearLocked()
+	})
 	p.httpServer.ReadHeaderTimeout = 10 * time.Second
 	p.httpServer.MaxHeaderBytes = 16 * 1024
 	p.httpServer.IdleTimeout = 30 * time.Second
@@ -85,6 +91,10 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 	p.httpServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Proxy-Authorization")), []byte("Bearer "+state.token)) != 1 {
 			http.Error(w, "unauthorized", 407)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/nosy/capture") {
+			state.capture.control(w, r)
 			return
 		}
 		if r.Method != http.MethodConnect {
@@ -220,7 +230,15 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 			<-copied
 			return
 		}
-		tlsConn := tls.Server(client, &tls.Config{GetCertificate: p.getCertificate, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}})
+		capture := state.capture.begin(app, r.Host, strings.ToLower(sni), flow)
+		var tlsClient net.Conn = client
+		tlsConfig := &tls.Config{GetCertificate: p.getCertificate, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
+		if capture != nil {
+			defer capture.finish()
+			tlsClient = &captureConn{Conn: client, capture: capture}
+			tlsConfig.KeyLogWriter = capture
+		}
+		tlsConn := tls.Server(tlsClient, tlsConfig)
 		ctx, cancel := context.WithTimeout(p.shutdownCtx, 10*time.Second)
 		err = tlsConn.HandshakeContext(ctx)
 		cancel()

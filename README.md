@@ -1280,3 +1280,30 @@ names or bodies. They describe observation, not remote receipt, browser intent,
 or proof a URL was visited. Existing request auditing and policy gates remain
 unchanged. The observer is off in ordinary and daemon v2 modes. Real-browser and
 signed-host qualification is separate from the local tests.
+
+### Nosy targeted TLS capture (development preview)
+
+The dedicated authenticated native-inspection listener supports an opt-in,
+one-connection capture controlled by Nosy's native UI. The normal proxy listener
+and secret-injection paths do not collect capture keys. `--nosy-capture-version`
+reports protocol version 1.
+
+After bearer authentication, `POST /nosy/capture` accepts `app` (the native
+process-instance SHA-256), `endpoint` (an admitted IP:443), and optional
+`serverName`. Only the next exact matching intercepted handshake is selected;
+opaque fallback and rejected policy never become inspection permission. The
+returned random `id` is required for GET status, POST `/nosy/capture/stop`, DELETE,
+and GET `/nosy/capture/export`. Status contains counts, not secrets.
+
+Wait is limited to 60 seconds; recording is limited to two minutes, 16 MiB of
+reconstructed stream and 64 KiB of TLS key records. Only one capture is retained,
+and ready data expires after five minutes. Stop/limits end recording without
+closing the application's connection. Discard and engine shutdown remove data.
+
+Export requires a stopped capture with keys. The pcapng contains a TLS Secrets
+Block and synthetic IPv4/TCP packets for the client-facing TLS byte stream.
+It is explicitly **not a raw packet capture**: addresses, acknowledgements,
+segmentation and timing are reconstructed. The section comment records this
+limitation and original endpoint. The file can expose sensitive request and
+response content. No keys are emitted to standard output or audit logs, and no
+key or traffic capture occurs before the explicit arm operation.
