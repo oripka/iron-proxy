@@ -98,9 +98,9 @@ func TestNativeInspectionTLSAndFallback(t *testing.T) {
 				next, e := nativeConnect(t, addr, target, app, upstreamPool)
 				if e == nil {
 					require.NoError(t, next.Close())
-					return !strict
+					return true
 				}
-				return strict
+				return false
 			}, time.Second, 20*time.Millisecond)
 			// Another process never inherits that compatibility exception.
 			_, err = nativeConnect(t, addr, target, strings.Repeat("c", 64), upstreamPool)

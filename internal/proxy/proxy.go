@@ -48,6 +48,8 @@ type Proxy struct {
 	certCache            *certcache.Cache
 	pipeline             *transform.PipelineHolder
 	transport            *http.Transport
+	nativeTransport      http.RoundTripper
+	nativeQUIC           bool
 	resolver             *net.Resolver
 	guard                *dnsguard.Guard
 	mcpPolicy            *mcp.PolicyHolder
@@ -516,6 +518,9 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request, tunnelInfo *t
 		return
 	}
 	copyHeaders(upstreamReq.Header, r.Header)
+	// Trailer values arrive as the original body reaches EOF. Preserve that map.
+	upstreamReq.Trailer = r.Trailer
+	upstreamReq.Body = &forwardTrailerBody{ReadCloser: upstreamReq.Body, source: r, destination: upstreamReq}
 	sanitizeUpstreamHeaders(upstreamReq.Header)
 	// If a transform buffered the request body, set ContentLength so the
 	// upstream receives a Content-Length header instead of chunked encoding.
@@ -1117,6 +1122,9 @@ func buildTransport(resolver *net.Resolver, guard *dnsguard.Guard, responseHeade
 }
 
 func (p *Proxy) doUpstream(req *http.Request) (*http.Response, error) {
+	if p.nativeTransport != nil {
+		return p.nativeTransport.RoundTrip(req)
+	}
 	return p.transport.RoundTrip(req)
 }
 

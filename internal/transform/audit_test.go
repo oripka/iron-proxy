@@ -391,4 +391,8 @@ func TestAuditNativeProvenancePreservesRequestVerdict(t *testing.T) {
 	require.Equal(t, "reject", parsed["audit"].(map[string]any)["action"])
 	require.Equal(t, "interactive_policy", parsed["rejected_by"])
 	require.NotContains(t, raw, "Proxy-Authorization")
+	result.Tunnel.Native.InspectionSession = ""
+	_, raw = captureAuditLog(result)
+	require.NotContains(t, raw, "/blocked")
+	require.NotContains(t, raw, "annotations")
 }

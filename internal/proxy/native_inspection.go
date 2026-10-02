@@ -10,6 +10,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -89,6 +90,7 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 		}
 	}
 	requestSlots := make(chan struct{}, 512)
+	quicSlots := make(chan struct{}, 64)
 	p.httpServer.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("Proxy-Authorization")), []byte("Bearer "+state.token)) != 1 {
 			http.Error(w, "unauthorized", 407)
@@ -96,6 +98,17 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 		}
 		if strings.HasPrefix(r.URL.Path, "/nosy/capture") {
 			state.capture.control(w, r)
+			return
+		}
+		if r.URL.Path == "/nosy/compatibility/reset" && r.Method == http.MethodPost {
+			state.mu.Lock()
+			clear(state.failures)
+			state.mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path == "/nosy/quic" && p.nativeQUIC && len(requireV2) == 0 {
+			p.handleNativeQUIC(w, r, state, admittedPort, quicSlots, requestSlots)
 			return
 		}
 		if r.Method != http.MethodConnect {
@@ -195,7 +208,7 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 			report("unsupported")
 			return
 		}
-		if v2 {
+		if sni != "" {
 			allowed, rejected, admitted := p.tunnelTransformCheck(r.RemoteAddr, net.JoinHostPort(sni, port), headers)
 			if !allowed {
 				if rejected != nil && rejected.Body != nil {
@@ -207,12 +220,13 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 			info = admitted
 		}
 		client = &bufferedConn{Conn: client, reader: bufio.NewReader(io.MultiReader(bytes.NewReader(peeked), client))}
-		key := app + "|" + r.Host + "|" + strings.ToLower(sni)
+		key := "tcp|" + app + "|" + application + "|" + r.Host + "|" + strings.ToLower(sni)
 		state.mu.Lock()
 		until := state.failures[key]
 		state.mu.Unlock()
-		opaque := sni == "" || time.Now().Before(until)
-		if opaque && state.failClosed {
+		compatible := application != "" && !v2 && p.pipeline.Load().AllowsOpaqueConnections() && time.Now().Before(until)
+		opaque := sni == "" || compatible
+		if opaque && (!p.pipeline.Load().AllowsOpaqueConnections() || (!compatible && state.failClosed)) {
 			report("inspection_required")
 
 			return
@@ -225,7 +239,11 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 				return
 			}
 			defer upstream.Close()
-			report("bypassed")
+			if compatible {
+				report("certificate_compatibility")
+			} else {
+				report("bypassed")
+			}
 			copied := make(chan struct{})
 			go func() {
 				_, _ = io.Copy(upstream, client)
@@ -255,15 +273,12 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 		if err != nil {
 			// Only client certificate rejection qualifies for compatibility fallback.
 			// EOF, timeouts and upstream failures never train a bypass.
-			text := err.Error()
-			rejected := strings.Contains(text, "remote error: tls:") && (strings.Contains(text, "certificate") || strings.Contains(text, "unknown certificate authority"))
-			if rejected {
+			rejected := nativeTLSCertificateRejection(err)
+			if rejected && application != "" && !v2 && p.pipeline.Load().AllowsOpaqueConnections() {
 				state.remember(key)
-				if state.failClosed {
-					report("inspection_required")
-				} else {
-					report("trust_failed")
-				}
+				report("trust_failed")
+			} else if rejected {
+				report("trust_failed")
 			} else {
 				report("opaque")
 			}
@@ -296,32 +311,13 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 				return
 			}
 			requestID := fmt.Sprintf("%s:%d", flow, requestSequence.Add(1))
-			privacyHost := inner.Host
-			if host, _, err := net.SplitHostPort(privacyHost); err == nil {
-				privacyHost = host
-			}
-			if p.browserPrivacy && privacyVendor(privacyHost) {
-				finish := observePrivacy(inner)
-				var once sync.Once
-				emit := func() {
-					once.Do(func() {
-						p.logger.Info("browser_privacy", slog.String("flow_id", flow), slog.String("request_id", requestID),
-							slog.String("host", strings.TrimSuffix(strings.ToLower(privacyHost), ".")), slog.Any("summary", finish()))
-					})
-				}
-				if body, ok := inner.Body.(*privacyBody); ok {
-					body.onComplete = emit
-				} else {
-					emit()
-				}
-				defer emit()
-			}
+			defer p.observeNativePrivacy(inner, flow, requestID)()
 			observed := &nativeResponseWriter{ResponseWriter: w, status: 200}
 			defer func() {
 				outcome := "response-only" // HTTP status alone is not a policy verdict.
 				p.logger.Info("native_http_request", slog.String("flow_id", flow), slog.String("policy_revision", revision),
 					slog.String("inspection_session", session), slog.String("request_id", requestID),
-					slog.String("method", inner.Method), slog.String("host", inner.Host), slog.String("path", inner.URL.EscapedPath()),
+					slog.String("method", inner.Method), slog.String("host", inner.Host),
 					slog.Int("status_code", observed.status), slog.String("outcome", outcome))
 			}()
 			w = observed
@@ -333,7 +329,6 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 			// Upgrades use a separate dial path in the generic proxy. Do not allow
 			// that path to escape the native endpoint pinning contract.
 			if inner.Header.Get("Upgrade") != "" || inner.Method == http.MethodConnect {
-				state.remember(key)
 				http.Error(w, "upgrade unsupported by native inspection", 501)
 				if state.failClosed {
 					report("inspection_required")
@@ -359,6 +354,19 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 		}
 	})
 	return nil
+}
+
+func nativeTLSCertificateRejection(err error) bool {
+	var remote *net.OpError
+	if !errors.As(err, &remote) || remote.Op != "remote error" {
+		return false
+	}
+	switch remote.Err.Error() {
+	case "tls: bad certificate", "tls: unsupported certificate", "tls: revoked certificate", "tls: expired certificate", "tls: unknown certificate", "tls: unknown certificate authority":
+		return true
+	default:
+		return false
+	}
 }
 
 // References are metadata, never executable header fragments.

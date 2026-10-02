@@ -177,3 +177,17 @@ func (p *Pipeline) Names() string {
 	}
 	return strings.Join(names, " → ")
 }
+
+// AllowsOpaqueConnections is deliberately conservative: HTTP transforms and
+// invocation policy cannot be evaluated without decrypted requests.
+func (p *Pipeline) AllowsOpaqueConnections() bool {
+	if len(p.transforms) == 0 {
+		return false
+	}
+	for _, t := range p.transforms {
+		if t.Name() != "allowlist" {
+			return false
+		}
+	}
+	return true
+}

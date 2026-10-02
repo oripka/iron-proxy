@@ -52,6 +52,9 @@ import (
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "--nosy-quic-version":
+			fmt.Println("1")
+			return
 		case "--nosy-capture-version":
 			fmt.Println("3")
 			return
@@ -78,7 +81,8 @@ func main() {
 	nativeProvenance := flag.Bool("nosy-inspection-provenance", false, "require native inspection v2 provenance and fail-closed HTTP policy")
 	browserPrivacy := flag.Bool("nosy-browser-privacy", false, "observe bounded outbound vendor request categories without recording values")
 	nativeInspection := flag.Bool("nosy-inspection", false, "authenticated native firewall inspection listener")
-	nativeFailClosed := flag.Bool("nosy-inspection-fail-closed", false, "deny subsequent connections after certificate rejection")
+	nativeQUIC := flag.Bool("nosy-quic", false, "opt-in authenticated native HTTP/3 inspection")
+	nativeFailClosed := flag.Bool("nosy-inspection-fail-closed", false, "deny unsupported inspection; certificate compatibility is separate")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -105,6 +109,10 @@ func main() {
 
 	// Managed mode is determined by the presence of a control plane token.
 	managed := proxyToken != ""
+	if *nativeQUIC && (!*nativeInspection || *nativeProvenance) {
+		fmt.Fprintln(os.Stderr, "native QUIC requires standalone native inspection")
+		os.Exit(1)
+	}
 	// Compatibility fallback cannot enforce decrypted transforms. Keep this
 	// dedicated mode separate from secret injection and managed workloads.
 	if *browserPrivacy && (!*nativeInspection || *nativeProvenance) {
@@ -292,6 +300,9 @@ func main() {
 	})
 
 	if *nativeInspection {
+		if *nativeQUIC {
+			p.EnableNativeQUIC()
+		}
 		if *browserPrivacy {
 			p.EnableBrowserPrivacy()
 		}
