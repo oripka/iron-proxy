@@ -104,6 +104,14 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 		}
 		ip, port, err := net.SplitHostPort(r.Host)
 		app, flow := r.Header.Get("X-Nosy-App"), r.Header.Get("X-PacketSafari-Flow-ID")
+		application := r.Header.Get("X-Nosy-Capture-App")
+		if application != "" {
+			value, err := hex.DecodeString(application)
+			if err != nil || len(value) != 32 {
+				http.Error(w, "invalid capture identity", 400)
+				return
+			}
+		}
 		revision, session := r.Header.Get("X-Nosy-Policy-Revision"), r.Header.Get("X-Nosy-Inspection-Session")
 		v2 := r.Header.Get("X-Nosy-Inspection-Version") == "2"
 		if (len(requireV2) > 0 && requireV2[0] && !v2) || (v2 && (!nativeReference(revision, 64) || !nativeReference(session, 64))) {
@@ -135,6 +143,7 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 		headers := r.Header.Clone()
 		headers.Del("Proxy-Authorization")
 		headers.Del("X-Nosy-App")
+		headers.Del("X-Nosy-Capture-App")
 		headers.Del("X-PacketSafari-Flow-ID")
 		headers.Del("X-Nosy-Policy-Revision")
 		headers.Del("X-Nosy-Inspection-Session")
@@ -231,7 +240,7 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 			<-copied
 			return
 		}
-		capture := state.capture.begin(app, r.Host, strings.ToLower(sni), flow)
+		capture := state.capture.begin(application, r.Host, strings.ToLower(sni), flow)
 		var tlsClient net.Conn = client
 		tlsConfig := &tls.Config{GetCertificate: p.getCertificate, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
 		if capture != nil {
@@ -317,7 +326,7 @@ func (p *Proxy) enableNativeInspection(token string, failClosed bool, admittedPo
 			}()
 			w = observed
 			// These are authenticated tunnel metadata, never request headers.
-			for _, key := range []string{"Proxy-Authorization", "X-Nosy-App", "X-PacketSafari-Flow-ID", "X-Nosy-Policy-Revision", "X-Nosy-Inspection-Session", "X-Nosy-Inspection-Version"} {
+			for _, key := range []string{"Proxy-Authorization", "X-Nosy-Capture-App", "X-Nosy-App", "X-PacketSafari-Flow-ID", "X-Nosy-Policy-Revision", "X-Nosy-Inspection-Session", "X-Nosy-Inspection-Version"} {
 				inner.Header.Del(key)
 			}
 			reported.Do(func() { report("reported_decrypted") })

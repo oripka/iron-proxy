@@ -1281,29 +1281,36 @@ or proof a URL was visited. Existing request auditing and policy gates remain
 unchanged. The observer is off in ordinary and daemon v2 modes. Real-browser and
 signed-host qualification is separate from the local tests.
 
-### Nosy targeted TLS capture (development preview)
+### Nosy scoped TLS capture (development preview)
 
-The dedicated authenticated native-inspection listener supports an opt-in,
-one-connection capture controlled by Nosy's native UI. The normal proxy listener
-and secret-injection paths do not collect capture keys. `--nosy-capture-version`
-reports protocol version 1.
+The dedicated authenticated native-inspection listener supports opt-in capture
+sessions. `--nosy-capture-version` reports 2. Normal proxy and secret-injection
+paths do not collect capture keys.
 
-After bearer authentication, `POST /nosy/capture` accepts `app` (the native
-process-instance SHA-256), `endpoint` (an admitted IP:443), and optional
-`serverName`. Only the next exact matching intercepted handshake is selected;
-opaque fallback and rejected policy never become inspection permission. The
-returned random `id` is required for GET status, POST `/nosy/capture/stop`, DELETE,
-and GET `/nosy/capture/export`. Status contains counts, not secrets.
+After bearer authentication, POST `/nosy/capture` accepts `application` (the
+SHA-256 of team identifier + NUL + signing identifier) and/or `serverName`, with
+optional `includeSubdomains`. At least one selector is required. Both selectors
+mean intersection. Domains match normalized ClientHello SNI, not IP or DNS
+inference. Subdomains require a dot boundary. The authenticated provider supplies
+`X-Nosy-Capture-App`; missing identity cannot match an application scope. This
+identity is only capture selection, never authorization. The process-specific
+`X-Nosy-App` and all inspection policy/fallback gates retain their semantics.
 
-Wait is limited to 60 seconds; recording is limited to two minutes, 16 MiB of
-reconstructed stream and 64 KiB of TLS key records. Only one capture is retained,
-and ready data expires after five minutes. Stop/limits end recording without
-closing the application's connection. Discard and engine shutdown remove data.
+Every matching new intercepted connection joins the session. Closing a connection
+does not stop recording; established sessions cannot be recovered retroactively.
+A random `id` is required for GET status, POST `/nosy/capture/stop`, DELETE,
+and GET `/nosy/capture/export`. Status contains counts, never secrets.
 
-Export requires a stopped capture with keys. The pcapng contains a TLS Secrets
-Block and synthetic IPv4/TCP packets for the client-facing TLS byte stream.
-It is explicitly **not a raw packet capture**: addresses, acknowledgements,
-segmentation and timing are reconstructed. The section comment records this
-limitation and original endpoint. The file can expose sensitive request and
-response content. No keys are emitted to standard output or audit logs, and no
-key or traffic capture occurs before the explicit arm operation.
+One session is retained. Global limits are five minutes from Start, 16 MiB of
+reconstructed packets, 256 KiB of keys and 1,024 connections. A bounded buffer
+allocates on first match; no disk writes or HTTP decoding run in the capture path.
+Stop/limits stop recording, never traffic. Stopped data expires after five minutes;
+discard and shutdown clear it. Old stream callbacks cannot enter a new session.
+
+Export requires a stopped session with keys. PCAPNG includes a TLS Secrets Block
+and synthetic IPv4/TCP streams, with distinct ports and interfaces per connection.
+Interface descriptions preserve original endpoint, hostname, application and flow.
+Addresses, packet boundaries, acknowledgements and timing are reconstructed:
+this is **not original wire evidence**. Keys allow reading sensitive content in
+both directions. No secrets enter stdout/audit logs; collection starts only after
+explicit Start. Older single-connection control requests are rejected.

@@ -60,7 +60,7 @@ func nativeConnectVersion(t *testing.T, addr, target, app string, pool *x509.Cer
 	conn, err := net.DialTimeout("tcp", addr, time.Second)
 	require.NoError(t, err)
 	require.NoError(t, conn.SetDeadline(time.Now().Add(3*time.Second)))
-	_, err = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Bearer %s\r\nX-Nosy-App: %s\r\nX-PacketSafari-Flow-ID: provider:flow-test\r\n%s\r\n", target, target, strings.Repeat("a", 64), app, version)
+	_, err = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Bearer %s\r\nX-Nosy-App: %s\r\nX-Nosy-Capture-App: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\r\nX-PacketSafari-Flow-ID: provider:flow-test\r\n%s\r\n", target, target, strings.Repeat("a", 64), app, version)
 	require.NoError(t, err)
 	reader := bufio.NewReader(conn)
 	res, err := http.ReadResponse(reader, &http.Request{Method: "CONNECT"})

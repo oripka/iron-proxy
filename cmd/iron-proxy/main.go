@@ -53,7 +53,7 @@ func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "--nosy-capture-version":
-			fmt.Println("1")
+			fmt.Println("2")
 			return
 		case "--nosy-inspection-contract-version":
 			fmt.Println("2")

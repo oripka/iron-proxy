@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,7 +26,7 @@ import (
 
 func armCapture(t *testing.T, c *nativeCapture) string {
 	t.Helper()
-	r := httptest.NewRequest("POST", "/nosy/capture", strings.NewReader(`{"app":"`+strings.Repeat("b", 64)+`","endpoint":"203.0.113.7:443","serverName":"localhost"}`))
+	r := httptest.NewRequest("POST", "/nosy/capture", strings.NewReader(`{"application":"`+strings.Repeat("b", 64)+`","serverName":"localhost"}`))
 	w := httptest.NewRecorder()
 	c.control(w, r)
 	require.Equal(t, 200, w.Code)
@@ -36,13 +38,13 @@ func armCapture(t *testing.T, c *nativeCapture) string {
 func TestTargetCaptureScopeAndLimits(t *testing.T) {
 	c := &nativeCapture{}
 	id := armCapture(t, c)
-	cases := []struct{ app, endpoint, name string }{{strings.Repeat("c", 64), "203.0.113.7:443", "localhost"}, {strings.Repeat("b", 64), "203.0.113.8:443", "localhost"}, {strings.Repeat("b", 64), "203.0.113.7:443", "other"}}
+	cases := []struct{ app, endpoint, name string }{{strings.Repeat("c", 64), "203.0.113.7:443", "localhost"}, {strings.Repeat("b", 64), "203.0.113.7:443", "other"}}
 	for _, tc := range cases {
 		require.Nil(t, c.begin(tc.app, tc.endpoint, tc.name, "unrelated"))
 	}
 	s := c.begin(strings.Repeat("b", 64), "203.0.113.7:443", "localhost", "selected")
 	require.NotNil(t, s)
-	require.Nil(t, c.begin(strings.Repeat("b", 64), "203.0.113.7:443", "localhost", "second"))
+	require.NotNil(t, c.begin(strings.Repeat("b", 64), "203.0.113.8:443", "localhost", "second"))
 	s.record(0, make([]byte, captureLimit+1))
 	require.Equal(t, "ready", c.status.State)
 	require.LessOrEqual(t, c.data.Len(), captureLimit)
@@ -64,49 +66,56 @@ func TestTargetCaptureRealTLSWireshark(t *testing.T) {
 		t.Run(tls.VersionName(version), func(t *testing.T) {
 			c := &nativeCapture{}
 			id := armCapture(t, c)
-			s := c.begin(strings.Repeat("b", 64), "203.0.113.7:443", "localhost", "selected")
-			ca, key := generateTestCA(t)
-			cache, e := certcache.NewFromCA(ca, key, 16, time.Hour)
-			require.NoError(t, e)
-			// Reuse the production certificate callback from the native inspection proxy.
-			p := New(Options{CertCache: cache})
-			pool := x509.NewCertPool()
-			pool.AddCert(ca)
-			left, right := net.Pipe()
-			defer left.Close()
-			defer right.Close()
-			require.NoError(t, left.SetDeadline(time.Now().Add(5*time.Second)))
-			require.NoError(t, right.SetDeadline(time.Now().Add(5*time.Second)))
-			server := tls.Server(&captureConn{Conn: left, capture: s}, &tls.Config{GetCertificate: p.getCertificate, MinVersion: version, MaxVersion: version, KeyLogWriter: s})
-			client := tls.Client(right, &tls.Config{RootCAs: pool, ServerName: "localhost", MinVersion: version, MaxVersion: version})
-			done := make(chan error, 1)
-			go func() {
-				if e := server.HandshakeContext(context.Background()); e != nil {
-					done <- e
-					return
-				}
-				r := bufio.NewReader(server)
-				for {
-					line, e := r.ReadString('\n')
-					if e != nil {
+			for i := 0; i < 3; i++ {
+				s := c.begin(strings.Repeat("b", 64), "203.0.113.7:443", "localhost", "selected")
+				ca, key := generateTestCA(t)
+				cache, e := certcache.NewFromCA(ca, key, 16, time.Hour)
+				require.NoError(t, e)
+				// Reuse the production certificate callback from the native inspection proxy.
+				p := New(Options{CertCache: cache})
+				pool := x509.NewCertPool()
+				pool.AddCert(ca)
+				left, right := net.Pipe()
+				defer left.Close()
+				defer right.Close()
+				require.NoError(t, left.SetDeadline(time.Now().Add(5*time.Second)))
+				require.NoError(t, right.SetDeadline(time.Now().Add(5*time.Second)))
+				server := tls.Server(&captureConn{Conn: left, capture: s}, &tls.Config{GetCertificate: p.getCertificate, MinVersion: version, MaxVersion: version, KeyLogWriter: s})
+				client := tls.Client(right, &tls.Config{RootCAs: pool, ServerName: "localhost", MinVersion: version, MaxVersion: version})
+				done := make(chan error, 1)
+				go func() {
+					if e := server.HandshakeContext(context.Background()); e != nil {
 						done <- e
 						return
 					}
-					if line == "\r\n" {
-						break
+					r := bufio.NewReader(server)
+					for {
+						line, e := r.ReadString('\n')
+						if e != nil {
+							done <- e
+							return
+						}
+						if line == "\r\n" {
+							break
+						}
 					}
-				}
-				_, e := io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\ncapture-proof")
-				done <- e
-			}()
-			require.NoError(t, client.HandshakeContext(context.Background()))
-			_, e = io.WriteString(client, "GET /nosy-capture-proof HTTP/1.1\r\nHost: localhost\r\n\r\n")
-			require.NoError(t, e)
-			b := make([]byte, len("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\ncapture-proof"))
-			_, e = io.ReadFull(client, b)
-			require.NoError(t, e)
-			require.NoError(t, <-done)
-			s.finish()
+					_, e := io.WriteString(server, "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\ncapture-proof")
+					done <- e
+				}()
+				require.NoError(t, client.HandshakeContext(context.Background()))
+				_, e = io.WriteString(client, "GET /nosy-capture-proof HTTP/1.1\r\nHost: localhost\r\n\r\n")
+				require.NoError(t, e)
+				b := make([]byte, len("HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\ncapture-proof"))
+				_, e = io.ReadFull(client, b)
+				require.NoError(t, e)
+				require.NoError(t, <-done)
+				s.finish()
+				require.Equal(t, "capturing", c.status.State, "one connection ending must not end the session")
+			}
+			require.Equal(t, 3, c.status.Connections)
+			c.mu.Lock()
+			c.finishLocked("Stopped by user")
+			c.mu.Unlock()
 			w := httptest.NewRecorder()
 			c.control(w, httptest.NewRequest("GET", "/nosy/capture/export?id="+id, nil))
 			require.Equal(t, 200, w.Code)
@@ -139,7 +148,7 @@ func TestTargetCaptureRealTLSWireshark(t *testing.T) {
 			cmd := exec.Command(tshark, "-r", path, "-Y", "http.request", "-T", "fields", "-e", "http.request.uri")
 			out, e := cmd.CombinedOutput()
 			require.NoError(t, e, string(out))
-			require.Contains(t, string(out), "/nosy-capture-proof")
+			require.Equal(t, 3, strings.Count(string(out), "/nosy-capture-proof"))
 			cmd = exec.Command(tshark, "-r", path, "-Y", "http.response", "-T", "fields", "-e", "http.response.code")
 			out, e = cmd.CombinedOutput()
 			require.NoError(t, e, string(out))
@@ -179,7 +188,7 @@ func TestTargetCaptureNativeListenerReplaysClientHello(t *testing.T) {
 		p.httpServer.Handler.ServeHTTP(w, r)
 		return w
 	}
-	w := call("POST", "/nosy/capture", strings.NewReader(`{"app":"`+strings.Repeat("b", 64)+`","endpoint":"127.0.0.1:443","serverName":"localhost"}`))
+	w := call("POST", "/nosy/capture", strings.NewReader(`{"application":"`+strings.Repeat("b", 64)+`","serverName":"localhost"}`))
 	require.Equal(t, 200, w.Code)
 	var status captureStatus
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &status))
@@ -192,8 +201,9 @@ func TestTargetCaptureNativeListenerReplaysClientHello(t *testing.T) {
 		if json.Unmarshal(reply.Body.Bytes(), &now) != nil {
 			return false
 		}
-		return now.State == "ready"
+		return now.Connections == 1 && now.Active == 0
 	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, 200, call("POST", "/nosy/capture/stop?id="+status.ID, nil).Code)
 	reply := call("GET", "/nosy/capture/export?id="+status.ID, nil)
 	require.Equal(t, 200, reply.Code)
 	raw := reply.Body.Bytes()
@@ -215,7 +225,7 @@ func TestTargetCaptureNativeListenerReplaysClientHello(t *testing.T) {
 }
 
 func TestTargetCaptureControlBoundsAndStop(t *testing.T) {
-	cases := []string{`{}`, `{"app":"bad","endpoint":"203.0.113.7:443"}`, `{"app":"` + strings.Repeat("b", 64) + `","endpoint":"203.0.113.7:80"}`, `{"app":"` + strings.Repeat("b", 64) + `","endpoint":"example.com:443"}`, `{"unknown":true}`}
+	cases := []string{`{}`, `{"application":"bad"}`, `{"application":"` + strings.Repeat("b", 64) + `","endpoint":"203.0.113.7:80"}`, `{"application":"` + strings.Repeat("b", 64) + `","endpoint":"example.com:443"}`, `{"unknown":true}`}
 	for _, body := range cases {
 		t.Run(body, func(t *testing.T) {
 			c := &nativeCapture{}
@@ -244,4 +254,72 @@ func TestTargetCaptureControlBoundsAndStop(t *testing.T) {
 	require.NoError(t, e)
 	require.Equal(t, size, c.data.Len())
 	require.Equal(t, keys, c.keys.Len())
+}
+
+func TestCaptureSessionScopes(t *testing.T) {
+	cases := []struct {
+		name      string
+		target    captureTarget
+		app, host string
+		want      bool
+	}{
+		{"app across domains", captureTarget{Application: "app"}, "app", "different.test", true},
+		{"other app excluded", captureTarget{Application: "app"}, "other", "same.test", false},
+		{"missing provider identity excluded", captureTarget{Application: "app"}, "", "same.test", false},
+		{"domain across apps", captureTarget{ServerName: "example.com"}, "other", "EXAMPLE.COM.", true},
+		{"exact excludes children", captureTarget{ServerName: "example.com"}, "app", "a.example.com", false},
+		{"children included", captureTarget{ServerName: "example.com", IncludeSubdomains: true}, "app", "a.example.com", true},
+		{"suffix confusion excluded", captureTarget{ServerName: "example.com", IncludeSubdomains: true}, "app", "evilexample.com", false},
+		{"combined wrong app", captureTarget{Application: "app", ServerName: "example.com"}, "other", "example.com", false},
+		{"combined wrong host", captureTarget{Application: "app", ServerName: "example.com"}, "app", "other.test", false},
+		{"combined matches", captureTarget{Application: "app", ServerName: "example.com"}, "app", "example.com", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { require.Equal(t, tc.want, tc.target.matches(tc.app, tc.host)) })
+	}
+}
+func TestCaptureSessionConcurrentStreamsAndGeneration(t *testing.T) {
+	c := &nativeCapture{}
+	id := armCapture(t, c)
+	var group sync.WaitGroup
+	for i := 0; i < 64; i++ {
+		group.Add(1)
+		go func(i int) {
+			defer group.Done()
+			s := c.begin(strings.Repeat("b", 64), "203.0.113.7:443", "localhost", fmt.Sprint(i))
+			if s == nil {
+				return
+			}
+			for j := 0; j < 16; j++ {
+				s.record(i%2, []byte("interleaved traffic"))
+			}
+			s.finish()
+			s.finish()
+		}(i)
+	}
+	group.Wait()
+	require.Equal(t, 64, c.status.Connections)
+	require.Zero(t, c.status.Active)
+	require.Equal(t, "capturing", c.status.State)
+	old := c.begin(strings.Repeat("b", 64), "203.0.113.7:443", "localhost", "old")
+	w := httptest.NewRecorder()
+	c.control(w, httptest.NewRequest("DELETE", "/nosy/capture?id="+id, nil))
+	require.Equal(t, 200, w.Code)
+	armCapture(t, c)
+	old.record(0, []byte("old session"))
+	_, err := old.Write([]byte("old secret"))
+	require.NoError(t, err)
+	old.finish()
+	require.Zero(t, c.status.Connections)
+	require.Zero(t, c.status.Active)
+	require.Zero(t, c.data.Len())
+	require.Zero(t, c.keys.Len())
+	for i := 0; i < captureConnectionLimit; i++ {
+		s := c.begin(strings.Repeat("b", 64), "203.0.113.7:443", "localhost", "bounded")
+		require.NotNil(t, s)
+		s.finish()
+	}
+	require.Nil(t, c.begin(strings.Repeat("b", 64), "203.0.113.7:443", "localhost", "over limit"))
+	require.Equal(t, "ready", c.status.State)
+	require.Equal(t, captureConnectionLimit, c.status.Connections)
 }

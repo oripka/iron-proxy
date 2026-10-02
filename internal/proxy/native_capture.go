@@ -1,6 +1,6 @@
 package proxy
 
-// Targeted capture records one client-facing TLS stream. Packet boundaries,
+// Targeted capture records scoped client-facing TLS streams. Packet boundaries,
 // addresses and TCP acknowledgements are reconstructed, never wire evidence.
 import (
 	"bytes"
@@ -11,24 +11,50 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
 
 const captureLimit = 16 << 20
+const captureKeyLimit = 256 << 10
+const captureConnectionLimit = 1024
 
 type captureTarget struct {
-	App        string `json:"app"`
-	Endpoint   string `json:"endpoint"`
-	ServerName string `json:"serverName"`
+	Application       string `json:"application"`
+	ServerName        string `json:"serverName"`
+	IncludeSubdomains bool   `json:"includeSubdomains"`
 }
+
+func (t captureTarget) matches(app, name string) bool {
+	name = strings.TrimSuffix(strings.ToLower(name), ".")
+	return (t.Application == "" || t.Application == app) && (t.ServerName == "" || t.ServerName == name || (t.IncludeSubdomains && strings.HasSuffix(name, "."+t.ServerName)))
+}
+func captureDomain(name string) bool {
+	if len(name) == 0 || len(name) > 253 || net.ParseIP(name) != nil {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 type captureStatus struct {
-	ID     string `json:"id"`
-	State  string `json:"state"`
-	Reason string `json:"reason"`
-	Flow   string `json:"flow"`
-	Bytes  int    `json:"bytes"`
-	Keys   int    `json:"keys"`
+	ID          string `json:"id"`
+	State       string `json:"state"`
+	Reason      string `json:"reason"`
+	Connections int    `json:"connections"`
+	Active      int    `json:"active"`
+	Bytes       int    `json:"bytes"`
+	Keys        int    `json:"keys"`
 }
 type nativeCapture struct {
 	exporting bool
@@ -37,7 +63,6 @@ type nativeCapture struct {
 	status    captureStatus
 	data      bytes.Buffer
 	keys      bytes.Buffer
-	seq       [2]uint32
 	timer     *time.Timer
 }
 
@@ -87,9 +112,9 @@ func (c *nativeCapture) control(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid target", 400)
 			return
 		}
-		app, err := hex.DecodeString(target.App)
-		ip, port, e := net.SplitHostPort(target.Endpoint)
-		if err != nil || len(app) != 32 || e != nil || net.ParseIP(ip) == nil || port != "443" || len(target.ServerName) > 253 {
+		app, err := hex.DecodeString(target.Application)
+		target.ServerName = strings.TrimSuffix(strings.ToLower(target.ServerName), ".")
+		if (target.Application == "" && target.ServerName == "") || (target.Application != "" && (err != nil || len(app) != 32)) || (target.ServerName != "" && !captureDomain(target.ServerName)) || (target.IncludeSubdomains && target.ServerName == "") {
 			http.Error(w, "invalid target", 400)
 			return
 		}
@@ -100,13 +125,12 @@ func (c *nativeCapture) control(w http.ResponseWriter, r *http.Request) {
 		}
 		c.target = target
 		c.status = captureStatus{ID: hex.EncodeToString(id[:]), State: "armed"}
-		c.seq = [2]uint32{1, 1}
 		captureID := c.status.ID
-		c.timer = time.AfterFunc(time.Minute, func() {
+		c.timer = time.AfterFunc(5*time.Minute, func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			if c.status.ID == captureID {
-				c.finishLocked("No matching connection within 60 seconds")
+				c.finishLocked("Five-minute session limit reached")
 			}
 		})
 	} else {
@@ -164,53 +188,61 @@ func (c *nativeCapture) control(w http.ResponseWriter, r *http.Request) {
 func (c *nativeCapture) begin(app, endpoint, name, flow string) *captureStream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.status.State != "armed" || c.target.App != app || c.target.Endpoint != endpoint || (c.target.ServerName != "" && c.target.ServerName != name) {
+	if (c.status.State != "armed" && c.status.State != "capturing") || !c.target.matches(app, name) {
 		return nil
 	}
-	c.timer.Stop()
-	c.data.Grow(captureLimit)
-	c.keys.Grow(65536)
-	c.status.State = "capturing"
-	c.status.Flow = flow
-	id := c.status.ID
-	c.timer = time.AfterFunc(2*time.Minute, func() {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.status.ID == id {
-			c.finishLocked("Two-minute capture limit reached")
-		}
-	})
-	header := make([]byte, 16)
-	binary.LittleEndian.PutUint32(header, 0x1a2b3c4d)
-	binary.LittleEndian.PutUint16(header[4:], 1)
-	binary.LittleEndian.PutUint64(header[8:], ^uint64(0))
-	note, err := json.Marshal(map[string]string{"format": "Nosy reconstructed client-facing TLS stream", "limitations": "Synthetic IP addresses, TCP acknowledgements, packet boundaries and timing; not original wire packets. Contains TLS secrets.", "flow": flow, "originalEndpoint": endpoint, "serverName": name})
-	if err == nil { // String-only metadata has no unsupported JSON values.
-		option := make([]byte, 4)
-		binary.LittleEndian.PutUint16(option, 1)
-		binary.LittleEndian.PutUint16(option[2:], uint16(len(note)))
-		header = append(header, option...)
-		header = append(header, note...)
-		for len(header)%4 != 0 {
-			header = append(header, 0)
-		}
-		header = append(header, 0, 0, 0, 0)
+	if c.status.Connections >= captureConnectionLimit {
+		c.finishLocked("1,024 connection limit reached")
+		return nil
 	}
-	c.data.Write(captureBlock(0x0a0d0d0a, header))
+	if c.data.Len()+2048 > captureLimit {
+		c.finishLocked("16 MiB capture limit reached")
+		return nil
+	}
+	first := c.status.Connections == 0
+	if first {
+		c.data.Grow(captureLimit)
+		c.keys.Grow(captureKeyLimit)
+	}
+	stream := &captureStream{owner: c, id: c.status.ID, index: uint32(c.status.Connections), seq: [2]uint32{1, 1}}
+	c.status.State = "capturing"
+	c.status.Connections++
+	c.status.Active++
+	if first {
+		header := make([]byte, 16)
+		binary.LittleEndian.PutUint32(header, 0x1a2b3c4d)
+		binary.LittleEndian.PutUint16(header[4:], 1)
+		binary.LittleEndian.PutUint64(header[8:], ^uint64(0))
+		c.data.Write(captureBlock(0x0a0d0d0a, header))
+	}
 	iface := make([]byte, 8)
 	binary.LittleEndian.PutUint16(iface, 101)
 	binary.LittleEndian.PutUint32(iface[4:], 65535)
+	note, err := json.Marshal(map[string]string{"format": "Nosy reconstructed client-facing TLS stream", "limitations": "Synthetic IP addresses, TCP acknowledgements, packet boundaries and timing; not original wire packets. Contains TLS secrets.", "flow": flow, "application": app, "originalEndpoint": endpoint, "serverName": name})
+	if err == nil { // String-only metadata has no unsupported JSON values.
+		option := make([]byte, 4)
+		binary.LittleEndian.PutUint16(option, 3) // if_description, one interface per connection.
+		binary.LittleEndian.PutUint16(option[2:], uint16(len(note)))
+		iface = append(iface, option...)
+		iface = append(iface, note...)
+		for len(iface)%4 != 0 {
+			iface = append(iface, 0)
+		}
+		iface = append(iface, 0, 0, 0, 0)
+	}
 	c.data.Write(captureBlock(1, iface))
-	// Synthetic handshake establishes direction and sequence numbers for Wireshark.
-	c.packetLocked(0, nil, 2)
-	c.packetLocked(1, nil, 18)
-	c.packetLocked(0, nil, 16)
-	return &captureStream{owner: c, id: id}
+	stream.packetLocked(0, nil, 2)
+	stream.packetLocked(1, nil, 18)
+	stream.packetLocked(0, nil, 16)
+	return stream
 }
 
 type captureStream struct {
-	owner *nativeCapture
-	id    string
+	owner    *nativeCapture
+	id       string
+	index    uint32
+	seq      [2]uint32
+	finished bool
 }
 
 func (s *captureStream) finish() {
@@ -220,16 +252,17 @@ func (s *captureStream) finish() {
 	c := s.owner
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.status.ID == s.id {
-		c.finishLocked("Connection ended")
+	if c.status.ID == s.id && !s.finished {
+		s.finished = true
+		c.status.Active--
 	}
 }
 func (s *captureStream) Write(p []byte) (int, error) { // tls.Config.KeyLogWriter; capture failure must not break traffic.
 	c := s.owner
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.status.ID == s.id && c.status.State == "capturing" {
-		if c.keys.Len()+len(p) > 65536 {
+	if c.status.ID == s.id && c.status.State == "capturing" && !s.finished {
+		if c.keys.Len()+len(p) > captureKeyLimit {
 			c.finishLocked("TLS key limit reached")
 		} else {
 			c.keys.Write(p)
@@ -245,7 +278,7 @@ func (s *captureStream) record(direction int, p []byte) {
 	c := s.owner
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.status.ID != s.id || c.status.State != "capturing" {
+	if c.status.ID != s.id || c.status.State != "capturing" || s.finished {
 		return
 	}
 	for len(p) > 0 {
@@ -254,7 +287,7 @@ func (s *captureStream) record(direction int, p []byte) {
 			c.finishLocked("16 MiB capture limit reached")
 			return
 		}
-		c.packetLocked(direction, p[:n], 24)
+		s.packetLocked(direction, p[:n], 24)
 		p = p[n:]
 	}
 	c.status.Bytes = c.data.Len()
@@ -298,7 +331,8 @@ func checksum(p []byte) uint16 {
 	}
 	return ^uint16(sum)
 }
-func (c *nativeCapture) packetLocked(d int, p []byte, flags byte) {
+func (s *captureStream) packetLocked(d int, p []byte, flags byte) {
+	c := s.owner
 	packet := make([]byte, 40+len(p))
 	packet[0] = 0x45
 	binary.BigEndian.PutUint16(packet[2:], uint16(len(packet)))
@@ -306,7 +340,7 @@ func (c *nativeCapture) packetLocked(d int, p []byte, flags byte) {
 	packet[9] = 6
 	copy(packet[12:], []byte{192, 0, 2, 1})
 	copy(packet[16:], []byte{192, 0, 2, 2})
-	src, dst := uint16(49152), uint16(443)
+	src, dst := uint16(49152+s.index), uint16(443)
 	if d == 1 {
 		copy(packet[12:], []byte{192, 0, 2, 2})
 		copy(packet[16:], []byte{192, 0, 2, 1})
@@ -315,13 +349,13 @@ func (c *nativeCapture) packetLocked(d int, p []byte, flags byte) {
 	binary.BigEndian.PutUint16(packet[10:], checksum(packet[:20]))
 	binary.BigEndian.PutUint16(packet[20:], src)
 	binary.BigEndian.PutUint16(packet[22:], dst)
-	seq := c.seq[d]
+	seq := s.seq[d]
 	if flags&2 != 0 {
 		seq = 0
 	}
 	binary.BigEndian.PutUint32(packet[24:], seq)
 	if flags&16 != 0 {
-		binary.BigEndian.PutUint32(packet[28:], c.seq[1-d])
+		binary.BigEndian.PutUint32(packet[28:], s.seq[1-d])
 	}
 	packet[32] = 0x50
 	packet[33] = flags
@@ -333,8 +367,9 @@ func (c *nativeCapture) packetLocked(d int, p []byte, flags byte) {
 	binary.BigEndian.PutUint16(pseudo[10:], uint16(len(packet)-20))
 	pseudo = append(pseudo, packet[20:]...)
 	binary.BigEndian.PutUint16(packet[36:], checksum(pseudo))
-	c.seq[d] += uint32(len(p))
+	s.seq[d] += uint32(len(p))
 	body := make([]byte, 20)
+	binary.LittleEndian.PutUint32(body, s.index)
 	now := uint64(time.Now().UnixMicro())
 	binary.LittleEndian.PutUint32(body[4:], uint32(now>>32))
 	binary.LittleEndian.PutUint32(body[8:], uint32(now))
