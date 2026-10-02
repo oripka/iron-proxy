@@ -24,6 +24,8 @@ type captureTarget struct {
 	Application       string `json:"application"`
 	ServerName        string `json:"serverName"`
 	IncludeSubdomains bool   `json:"includeSubdomains"`
+	DurationSeconds   int    `json:"durationSeconds"`
+	MaxBytes          int    `json:"maxBytes"`
 }
 
 func (t captureTarget) matches(app, name string) bool {
@@ -118,6 +120,16 @@ func (c *nativeCapture) control(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid target", 400)
 			return
 		}
+		if target.DurationSeconds == 0 {
+			target.DurationSeconds = 300
+		}
+		if target.MaxBytes == 0 {
+			target.MaxBytes = captureLimit
+		}
+		if target.DurationSeconds < 60 || target.DurationSeconds > 900 || target.MaxBytes < 4<<20 || target.MaxBytes > captureLimit {
+			http.Error(w, "invalid capture limits", 400)
+			return
+		}
 		var id [16]byte
 		if _, err := rand.Read(id[:]); err != nil {
 			http.Error(w, "capture unavailable", 500)
@@ -126,11 +138,11 @@ func (c *nativeCapture) control(w http.ResponseWriter, r *http.Request) {
 		c.target = target
 		c.status = captureStatus{ID: hex.EncodeToString(id[:]), State: "armed"}
 		captureID := c.status.ID
-		c.timer = time.AfterFunc(5*time.Minute, func() {
+		c.timer = time.AfterFunc(time.Duration(target.DurationSeconds)*time.Second, func() {
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			if c.status.ID == captureID {
-				c.finishLocked("Five-minute session limit reached")
+				c.finishLocked("Recording duration limit reached")
 			}
 		})
 	} else {
@@ -195,13 +207,13 @@ func (c *nativeCapture) begin(app, endpoint, name, flow string) *captureStream {
 		c.finishLocked("1,024 connection limit reached")
 		return nil
 	}
-	if c.data.Len()+2048 > captureLimit {
-		c.finishLocked("16 MiB capture limit reached")
+	if c.data.Len()+2048 > c.target.MaxBytes {
+		c.finishLocked("Capture size limit reached")
 		return nil
 	}
 	first := c.status.Connections == 0
 	if first {
-		c.data.Grow(captureLimit)
+		c.data.Grow(c.target.MaxBytes)
 		c.keys.Grow(captureKeyLimit)
 	}
 	stream := &captureStream{owner: c, id: c.status.ID, index: uint32(c.status.Connections), seq: [2]uint32{1, 1}}
@@ -283,8 +295,8 @@ func (s *captureStream) record(direction int, p []byte) {
 	}
 	for len(p) > 0 {
 		n := min(len(p), 16384)
-		if c.data.Len()+n+80 > captureLimit {
-			c.finishLocked("16 MiB capture limit reached")
+		if c.data.Len()+n+80 > c.target.MaxBytes {
+			c.finishLocked("Capture size limit reached")
 			return
 		}
 		s.packetLocked(direction, p[:n], 24)

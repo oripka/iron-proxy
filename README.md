@@ -1284,12 +1284,13 @@ signed-host qualification is separate from the local tests.
 ### Nosy scoped TLS capture (development preview)
 
 The dedicated authenticated native-inspection listener supports opt-in capture
-sessions. `--nosy-capture-version` reports 2. Normal proxy and secret-injection
+sessions. `--nosy-capture-version` reports 3. Normal proxy and secret-injection
 paths do not collect capture keys.
 
 After bearer authentication, POST `/nosy/capture` accepts `application` (the
 SHA-256 of team identifier + NUL + signing identifier) and/or `serverName`, with
-optional `includeSubdomains`. At least one selector is required. Both selectors
+optional `includeSubdomains`, `durationSeconds` (60–900; default 300), and
+`maxBytes` (4–16 MiB; default 16 MiB). Invalid limits are rejected. At least one selector is required. Both selectors
 mean intersection. Domains match normalized ClientHello SNI, not IP or DNS
 inference. Subdomains require a dot boundary. The authenticated provider supplies
 `X-Nosy-Capture-App`; missing identity cannot match an application scope. This
@@ -1301,8 +1302,9 @@ does not stop recording; established sessions cannot be recovered retroactively.
 A random `id` is required for GET status, POST `/nosy/capture/stop`, DELETE,
 and GET `/nosy/capture/export`. Status contains counts, never secrets.
 
-One session is retained. Global limits are five minutes from Start, 16 MiB of
-reconstructed packets, 256 KiB of keys and 1,024 connections. A bounded buffer
+One session is retained. Default limits are five minutes from Start and 16 MiB of
+reconstructed packets. Hard ceilings are 15 minutes, 16 MiB, 256 KiB of keys
+and 1,024 connections. A bounded buffer
 allocates on first match; no disk writes or HTTP decoding run in the capture path.
 Stop/limits stop recording, never traffic. Stopped data expires after five minutes;
 discard and shutdown clear it. Old stream callbacks cannot enter a new session.

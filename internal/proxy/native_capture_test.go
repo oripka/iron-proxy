@@ -323,3 +323,30 @@ func TestCaptureSessionConcurrentStreamsAndGeneration(t *testing.T) {
 	require.Equal(t, "ready", c.status.State)
 	require.Equal(t, captureConnectionLimit, c.status.Connections)
 }
+
+func TestCaptureSessionConfigurableLimits(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		code int
+	}{
+		{`{"serverName":"example.com","durationSeconds":60,"maxBytes":4194304}`, 200},
+		{`{"serverName":"example.com","durationSeconds":900,"maxBytes":16777216}`, 200},
+		{`{"serverName":"example.com","durationSeconds":901}`, 400},
+		{`{"serverName":"example.com","durationSeconds":-1}`, 400},
+		{`{"serverName":"example.com","maxBytes":16777217}`, 400},
+	} {
+		c := &nativeCapture{}
+		w := httptest.NewRecorder()
+		c.control(w, httptest.NewRequest("POST", "/nosy/capture", strings.NewReader(tc.body)))
+		require.Equal(t, tc.code, w.Code)
+		if tc.code == 200 {
+			s := c.begin("", "192.0.2.1:443", "example.com", "test")
+			s.record(0, make([]byte, c.target.MaxBytes))
+			require.Equal(t, "ready", c.status.State)
+			require.LessOrEqual(t, c.status.Bytes, c.target.MaxBytes)
+		}
+		c.mu.Lock()
+		c.clearLocked()
+		c.mu.Unlock()
+	}
+}
