@@ -29,9 +29,13 @@ func NewOTELAuditFunc(provider *sdklog.LoggerProvider) AuditFunc {
 	logger := provider.Logger(instrumentationName)
 
 	return func(result *PipelineResult) {
+		result = nativeAuditView(result)
 		action := actionString(result.Action)
 		if result.Err != nil {
 			action = "error"
+		}
+		if result.ClientCanceled {
+			action = "client_cancel"
 		}
 
 		var rec log.Record

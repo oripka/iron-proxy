@@ -1,6 +1,7 @@
 package transform
 
 import (
+	"errors"
 	"log/slog"
 	"sync/atomic"
 )
@@ -19,32 +20,13 @@ type traceEntry struct {
 // rejected, ERROR for errored requests.
 func NewAuditLogger(logger *slog.Logger) AuditFunc {
 	return func(result *PipelineResult) {
+		result = nativeAuditView(result)
 		action := actionString(result.Action)
 		if result.Err != nil {
 			action = "error"
 		}
 		if result.ClientCanceled {
 			action = "client_cancel"
-		}
-		if result.Tunnel != nil && result.Tunnel.Native != nil && result.Tunnel.Native.InspectionSession == "" {
-			native := result.Tunnel.Native
-			// Native privacy mode keeps decisions, not URL values, transform
-			// annotations, payload captures or raw transport error strings.
-			attrs := []any{slog.Group("native", slog.String("flow_id", native.FlowID),
-				slog.String("policy_revision", native.PolicyRevision), slog.String("inspection_session", native.InspectionSession), slog.String("request_id", native.RequestID)),
-				slog.Group("audit", slog.String("method", result.Method), slog.String("host", result.Host),
-					slog.String("action", action), slog.Int("status_code", result.StatusCode),
-					slog.Int64("bytes_sent", atomic.LoadInt64(&result.RequestBytes)), slog.Int64("bytes_received", result.ResponseBytes))}
-			if result.Action == ActionReject {
-				for _, trace := range result.RequestTransforms {
-					if trace.Action == ActionReject {
-						attrs = append(attrs, slog.String("rejected_by", trace.Name))
-						break
-					}
-				}
-			}
-			logger.Info("request", attrs...)
-			return
 		}
 
 		attrs := []any{
@@ -132,6 +114,35 @@ func NewAuditLogger(logger *slog.Logger) AuditFunc {
 		default:
 			logger.Info("request", attrs...)
 		}
+	}
+}
+
+// Both exporters use the same standalone-native projection. Preserve decisions
+// and provenance without mutating the pipeline result or copying its live counter.
+func nativeAuditView(result *PipelineResult) *PipelineResult {
+	if result.Tunnel == nil || result.Tunnel.Native == nil || result.Tunnel.Native.InspectionSession != "" {
+		return result
+	}
+	redactError := func(err error) error {
+		if err != nil {
+			return errors.New("native_inspection_error")
+		}
+		return nil
+	}
+	traces := func(input []TransformTrace) []TransformTrace {
+		output := make([]TransformTrace, len(input))
+		for i, tr := range input {
+			output[i] = TransformTrace{Name: tr.Name, Action: tr.Action, Duration: tr.Duration, Err: redactError(tr.Err)}
+		}
+		return output
+	}
+	return &PipelineResult{
+		Host: result.Host, Method: result.Method, SNI: result.SNI, Mode: result.Mode,
+		StartedAt: result.StartedAt, Duration: result.Duration, Action: result.Action, StatusCode: result.StatusCode,
+		RequestBytes: atomic.LoadInt64(&result.RequestBytes), ResponseBytes: result.ResponseBytes,
+		Tunnel:            &TunnelInfo{Target: result.Tunnel.Target, Native: result.Tunnel.Native, RequestTransforms: traces(result.Tunnel.RequestTransforms)},
+		RequestTransforms: traces(result.RequestTransforms), ResponseTransforms: traces(result.ResponseTransforms),
+		Err: redactError(result.Err), ClientCanceled: result.ClientCanceled,
 	}
 }
 

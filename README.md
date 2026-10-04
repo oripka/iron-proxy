@@ -1210,10 +1210,11 @@ CONNECT and decrypted HTTP pass the transform pipeline. Authentication values
 are removed before audit/pipeline processing. Do not expose this listener or
 its token to untrusted clients: the token authorizes native admitted endpoints.
 
-On client certificate rejection, a bounded ten-minute process/IP/port/SNI cache
+On client certificate rejection, a bounded ten-minute process/signed-app/IP/port/SNI cache
 allows the next attempt to tunnel unchanged TLS. The first attempt may fail;
-requests are never replayed. `--nosy-inspection-fail-closed` instead denies those
-retries. HTTP upgrades are unsupported and train the same subsequent fallback;
+requests are never replayed. `--nosy-inspection-fail-closed` controls unavailable
+or unsupported inspection, not these otherwise permitted compatibility retries.
+HTTP upgrades are unsupported and do not train fallback;
 a valid ClientHello without SNI tunnels only in legacy fail-open mode. Other
 handshake/upstream failures do not train fallback. This path must not be
 used for secret-injection or mandatory HTTP-policy workloads: fail-open
@@ -1222,7 +1223,11 @@ intentionally forfeits HTTP inspection on these narrowly cached connections.
 One listener limits active tunnels and concurrent HTTP requests to 512 each;
 pre-handshake HTTP sockets are separately limited to 512. The compatibility
 cache holds at most 4,096 entries. Structured `native_inspection` records contain
-only flow identity and outcome; normal per-request audit remains enabled.
+only flow identity and outcome; per-request audit preserves decisions and
+per-transform verdicts in JSON and OTEL. Standalone native audits redact URL
+paths, annotations, payloads and raw error strings. Mandatory v2 audit semantics
+are unchanged. Opt-in HTTP/3 transport and isolated test instructions are in
+[Native QUIC inspection](docs/native-quic.md).
 `--nosy-inspection-version` prints `1` for bundle compatibility. This development
 preview has local TLS/fallback tests; signed macOS provider behavior and sustained
 load are separate qualification requirements. Default proxy modes are unchanged.
