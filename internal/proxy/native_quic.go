@@ -264,7 +264,7 @@ func (p *Proxy) handleNativeQUIC(w http.ResponseWriter, r *http.Request, state *
 	upstreamTLS.NextProtos = []string{http3.NextProtoH3}
 	upstreamConfig := nativeQUICConfig()
 	upstreamConfig.Versions = []quic.Version{quic.Version1}
-	upstream := &http3.Transport{TLSClientConfig: upstreamTLS, QUICConfig: upstreamConfig, DisableCompression: true,
+	upstream := &http3.Transport{TLSClientConfig: upstreamTLS, QUICConfig: upstreamConfig, DisableCompression: true, MaxResponseHeaderBytes: 32 << 10,
 		Dial: func(ctx context.Context, authority string, config *tls.Config, qc *quic.Config) (*quic.Conn, error) {
 			name, _, err := net.SplitHostPort(authority)
 			if err != nil || name != host || config.ServerName != host {
@@ -279,47 +279,68 @@ func (p *Proxy) handleNativeQUIC(w http.ResponseWriter, r *http.Request, state *
 	var once sync.Once
 	server := &http3.Server{MaxHeaderBytes: 32 << 10, IdleTimeout: 30 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, inner *http.Request) {
+			requestID := fmt.Sprintf("%s:%d", flow, sequence.Add(1))
+			requestInfo := cloneTunnelInfo(info)
+			if requestInfo == nil {
+				requestInfo = &transform.TunnelInfo{Target: address}
+			}
+			requestInfo.Native = &transform.NativeFlowInfo{FlowID: flow, PolicyRevision: revision, RequestID: requestID}
+			reject := func(status int, reason string) {
+				scoped.rejectNativeQUICRequest(w, inner, host, status, reason, requestInfo)
+			}
 			select {
 			case requests <- struct{}{}:
 				defer func() { <-requests }()
 			default:
-				http.Error(w, "request capacity reached", 503)
+				reject(http.StatusServiceUnavailable, "native_http3_capacity")
 				return
 			}
 			// Extended CONNECT, WebTransport and datagrams are not silently mapped
 			// onto ordinary requests. HTTP/3 settings do not advertise those features.
 			if inner.Method == http.MethodConnect || inner.Header.Get("Upgrade") != "" {
 				report("unsupported_protocol")
-				http.Error(w, "unsupported HTTP/3 operation", 501)
+				reject(http.StatusNotImplemented, "native_http3_protocol")
 				return
 			}
 			authority := inner.Host
 			if name, authorityPort, err := net.SplitHostPort(authority); err == nil {
 				if authorityPort != port {
-					http.Error(w, "authority mismatch", 421)
+					reject(http.StatusMisdirectedRequest, "native_http3_authority")
 					return
 				}
 				authority = name
 			}
 			name, ok := nativeHostname(authority)
 			if !ok || name != host || inner.TLS == nil || inner.TLS.ServerName != host {
-				http.Error(w, "authority mismatch", 421)
+				reject(http.StatusMisdirectedRequest, "native_http3_authority")
 				return
 			}
-			requestID := fmt.Sprintf("%s:%d", flow, sequence.Add(1))
 			defer p.observeNativePrivacy(inner, flow, requestID)()
 			for _, h := range []string{"Proxy-Authorization", "X-Nosy-App", "X-Nosy-Capture-App", "X-Nosy-Destination", "X-Nosy-Hostname", "X-PacketSafari-Flow-ID", "X-Nosy-Policy-Revision", "X-Nosy-Inspection-Session", "X-Nosy-Inspection-Version"} {
 				inner.Header.Del(h)
 			}
 			once.Do(func() { report("reported_decrypted") })
-			requestInfo := cloneTunnelInfo(info)
-			if requestInfo == nil {
-				requestInfo = &transform.TunnelInfo{Target: address}
-			}
-			requestInfo.Native = &transform.NativeFlowInfo{FlowID: flow, PolicyRevision: revision, RequestID: requestID}
 			scoped.handleHTTP(w, inner, requestInfo)
 		})}
 	_ = server.ServeQUICConn(client) // Connection shutdown is not a new inspection verdict.
+}
+
+// These are admission decisions, not evidence that decrypted HTTP rules ran.
+// Use the approved hostname and fixed reason codes, never the rejected authority.
+func (p *Proxy) rejectNativeQUICRequest(w http.ResponseWriter, r *http.Request, host string, status int, reason string, info *transform.TunnelInfo) {
+	trace := transform.TransformTrace{Name: reason, Action: transform.ActionReject}
+	result := &transform.PipelineResult{Host: host, Method: r.Method, Mode: transform.ModeMITM,
+		Tunnel: info, Action: transform.ActionReject, StatusCode: status}
+	if status == http.StatusServiceUnavailable {
+		result.Action = transform.ActionContinue
+		result.Err = errors.New(reason)
+		trace.Action = transform.ActionContinue
+		trace.Err = result.Err
+	}
+	result.RequestTransforms = []transform.TransformTrace{trace}
+	_, finish := p.beginPipelineRun(result)
+	defer finish()
+	http.Error(w, http.StatusText(status), status)
 }
 
 type nativeQUICUpstream struct {

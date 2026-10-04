@@ -26,7 +26,7 @@ import (
 
 // Like PacketSafari's tlsfixture/quic, this uses real quic-go HTTP/3 endpoints
 // and disposable CAs. Unlike its permissive fixture client, trust is verified.
-func quicFixture(t *testing.T, handler http.Handler) (*Proxy, string, string, *x509.CertPool, *x509.CertPool) {
+func quicFixture(t *testing.T, handler http.Handler, audit ...transform.AuditFunc) (*Proxy, string, string, *x509.CertPool, *x509.CertPool) {
 	t.Helper()
 	upstreamCA, upstreamKey := generateTestCA(t)
 	upstreamCache, err := certcache.NewFromCA(upstreamCA, upstreamKey, 16, time.Hour)
@@ -50,6 +50,9 @@ func quicFixture(t *testing.T, handler http.Handler) (*Proxy, string, string, *x
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 	pipeline := transform.NewPipeline([]transform.Transformer{allow}, transform.BodyLimits{}, logger)
 	pipeline.SetAuditFunc(func(result *transform.PipelineResult) {
+		for _, emit := range audit {
+			emit(result)
+		}
 		if result.Err != nil {
 			t.Logf("fixture upstream failure: %v", result.Err)
 		}

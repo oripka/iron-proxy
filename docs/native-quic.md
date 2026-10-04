@@ -43,6 +43,12 @@ and handshake idle timeout, 30-second idle and ten-minute channel lifetime.
 Listener health/session failure semantics belong to Nosy, not this exception
 cache. Do not expose credentials or test key logs in normal diagnostics.
 
+Both incoming request and upstream response headers have the 32 KiB limit.
+Parsed requests rejected before the shared HTTP pipeline emit one admission
+audit with a fixed `native_http3_*` reason and request ID. Such records do not
+claim HTTP rules were evaluated. Capacity failures are errors, not firewall
+denials; authority rejections record only the admitted hostname.
+
 ## Isolated tests
 
 No installed provider, CA trust changes or real network interception required:
