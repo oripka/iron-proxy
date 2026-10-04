@@ -213,6 +213,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	applyDefaults(&cfg)
+	if err := validateBuildConfig(&cfg); err != nil {
+		return nil, err
+	}
 
 	return &cfg, nil
 }
@@ -298,6 +301,9 @@ func applyDefaults(cfg *Config) {
 
 // Validate checks required fields and value constraints.
 func Validate(cfg *Config) error {
+	if err := validateBuildConfig(cfg); err != nil {
+		return err
+	}
 	if cfg.Proxy.HTTPListen == "" && cfg.Proxy.HTTPSListen == "" {
 		return fmt.Errorf("at least one proxy listener must be enabled")
 	}

@@ -1,3 +1,5 @@
+//go:build !nosy
+
 package secrets
 
 import (

@@ -1197,6 +1197,21 @@ shasum -a 256 iron-proxy-linux-amd64 | grep -F "$(grep -F 'iron-proxy-linux-amd6
 ```
 
 
+### Smaller Nosy build
+
+Build the desktop integration with `go build -tags nosy -trimpath -ldflags='-s -w' ./cmd/iron-proxy`.
+The `nosy` build omits PostgreSQL relaying/SQL parsing, external secret sources
+(`1password`, `1password_connect`, `aws_sm`, `aws_ssm`), and S3 configuration
+loading. Configurations requesting these features fail explicitly. Local
+configuration files, environment secret sources, HTTP/TLS inspection, policy
+checks, and AWS request signing remain available. Nosy resolves macOS Keychain
+items before passing secrets to the proxy.
+
+This excludes the embedded 1Password WebAssembly core and PostgreSQL parser,
+and their execution dependencies, from the linked desktop binary. Building
+without `-tags nosy` retains the full proxy. `iron-proxy --build-info` reports the
+build flavor and feature boundary without starting listeners or loading secrets.
+
 ### Nosy native inspection (local fork preview)
 
 `--nosy-inspection` selects a dedicated loopback CONNECT listener for Nosy's
