@@ -1003,6 +1003,7 @@ func isSSE(resp *http.Response) bool {
 // number of body bytes written to the client.
 func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) int64 {
 	copyHeaders(w.Header(), resp.Header)
+	defer writeTrailers(w, resp)
 	w.WriteHeader(resp.StatusCode)
 
 	reader := transform.RequireBufferedBody(resp.Body).StreamingReader()

@@ -26,6 +26,8 @@ EOF publishes request trailers before the upstream sends its trailing HEADERS.
 Cancellation reaches the independent upstream request. Normal upstream trust
 verification is mandatory. Upstream mTLS is unsupported and never trains an
 exception. Standalone native audit output excludes URL paths, payloads and raw errors.
+SSE responses flush events before stream completion and preserve final response
+trailers through the shared TCP/HTTP/3 streaming path.
 
 Only demonstrated remote certificate alerts train the shared bounded cache:
 transport + process instance + signed application + hostname + original IP:port,

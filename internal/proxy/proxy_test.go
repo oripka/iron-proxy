@@ -784,6 +784,7 @@ func TestHTTPProxy_WebSocketUpgrade(t *testing.T) {
 func TestHTTPProxy_SSEStreaming(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Trailer", "X-Stream-Result")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
 
@@ -801,6 +802,7 @@ func TestHTTPProxy_SSEStreaming(t *testing.T) {
 			_, _ = fmt.Fprint(w, event)
 			flusher.Flush()
 		}
+		w.Header().Set("X-Stream-Result", "complete")
 	}))
 	defer upstream.Close()
 
@@ -822,6 +824,7 @@ func TestHTTPProxy_SSEStreaming(t *testing.T) {
 	require.Contains(t, string(body), "data: event1")
 	require.Contains(t, string(body), "data: event2")
 	require.Contains(t, string(body), "data: event3")
+	require.Equal(t, "complete", resp.Trailer.Get("X-Stream-Result"))
 }
 
 func TestHTTPProxy_RequestContentLengthPreserved(t *testing.T) {
