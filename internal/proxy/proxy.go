@@ -730,6 +730,9 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}, &tls.Config{
 		GetCertificate: p.getCertificate,
 		MinVersion:     tls.VersionTLS12,
+		// Offer HTTP/2 like the tunnel listener does, so h2-only clients
+		// (gRPC) work through an HTTPS_PROXY pointed at this listener.
+		NextProtos: []string{"h2", "http/1.1"},
 	})
 
 	_ = tlsConn.SetDeadline(time.Now().Add(30 * time.Second))
@@ -759,6 +762,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}),
 		ReadHeaderTimeout: 30 * time.Second,
 	}
+	// Serve HTTP/2 when the client negotiated it; zero config never errors.
+	_ = http2.ConfigureServer(server, &http2.Server{})
 
 	err = server.Serve(&singleConnListener{
 		conn: tlsConn,
@@ -1043,7 +1048,11 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) int64 {
 // writeResponse writes resp to the client and returns the number of body
 // bytes written.
 func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) int64 {
-	copyHeaders(w.Header(), resp.Header)
+	// Strip only what came from upstream; headers the proxy already set on
+	// w (Connection: close on a refused CONNECT) stay.
+	upstreamHeader := resp.Header.Clone()
+	removeResponseConnectionHeaders(upstreamHeader)
+	copyHeaders(w.Header(), upstreamHeader)
 	// Forward upstream trailers (e.g. gRPC status) after the body.
 	defer writeTrailers(w, resp)
 	var body io.Reader
@@ -1210,5 +1219,23 @@ func writeTrailers(w http.ResponseWriter, resp *http.Response) {
 		for _, v := range vs {
 			w.Header().Add(http.TrailerPrefix+k, v)
 		}
+	}
+}
+
+// removeResponseConnectionHeaders drops the headers that describe the
+// upstream connection itself. Over HTTP/2 they are a protocol error (curl and
+// nghttp2 reject a forwarded Keep-Alive), and over HTTP/1.1 they would
+// describe the wrong connection. Proxy-Authenticate is kept: on a proxy's own
+// 407 it is addressed to this client.
+func removeResponseConnectionHeaders(h http.Header) {
+	for _, v := range h.Values("Connection") {
+		for _, t := range strings.Split(v, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				h.Del(t)
+			}
+		}
+	}
+	for _, name := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Transfer-Encoding"} {
+		h.Del(name)
 	}
 }
