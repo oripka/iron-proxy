@@ -23,18 +23,39 @@ func TestRemoveResponseConnectionHeaders(t *testing.T) {
 	h.Set("Connection", "keep-alive, X-Conn-Scoped")
 	h.Set("Keep-Alive", "timeout=5")
 	h.Set("Proxy-Connection", "keep-alive")
+	h.Add("Connection", "X-Second-Scoped")
 	h.Set("Transfer-Encoding", "chunked")
+	h.Set("Upgrade", "h2,h2c")
 	h.Set("X-Conn-Scoped", "1")
+	h.Set("X-Second-Scoped", "1")
+	h.Set("Trailer", "Grpc-Status")
 	h.Set("Proxy-Authenticate", `Basic realm="proxy"`)
 	h.Set("Content-Type", "text/plain")
 
 	removeResponseConnectionHeaders(h)
 
-	for _, name := range []string{"Connection", "Keep-Alive", "Proxy-Connection", "Transfer-Encoding", "X-Conn-Scoped"} {
+	for _, name := range []string{"Connection", "Keep-Alive", "Proxy-Connection", "Transfer-Encoding", "Upgrade", "X-Conn-Scoped", "X-Second-Scoped"} {
 		require.Empty(t, h.Get(name), name)
 	}
 	require.Equal(t, `Basic realm="proxy"`, h.Get("Proxy-Authenticate"))
 	require.Equal(t, "text/plain", h.Get("Content-Type"))
+	require.Equal(t, "Grpc-Status", h.Get("Trailer"))
+}
+
+func TestCopyUpstreamResponseHeadersKeepsProxySetHeaders(t *testing.T) {
+	dst := http.Header{}
+	dst.Set("Connection", "close")
+	upstream := http.Header{}
+	upstream.Set("Connection", "keep-alive")
+	upstream.Set("Keep-Alive", "timeout=5")
+	upstream.Set("Content-Type", "text/event-stream")
+
+	copyUpstreamResponseHeaders(dst, upstream)
+
+	require.Equal(t, []string{"close"}, dst.Values("Connection"))
+	require.Empty(t, dst.Get("Keep-Alive"))
+	require.Equal(t, "text/event-stream", dst.Get("Content-Type"))
+	require.Equal(t, "keep-alive", upstream.Get("Connection"), "upstream header must not be mutated")
 }
 
 // TestIntegration_HTTPListenerCONNECT_HTTP2 covers CONNECT on the plain HTTP

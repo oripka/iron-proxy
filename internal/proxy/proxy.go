@@ -1007,7 +1007,7 @@ func isSSE(resp *http.Response) bool {
 // streamSSE writes an SSE response with per-chunk flushing and returns the
 // number of body bytes written to the client.
 func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) int64 {
-	copyHeaders(w.Header(), resp.Header)
+	copyUpstreamResponseHeaders(w.Header(), resp.Header)
 	defer writeTrailers(w, resp)
 	w.WriteHeader(resp.StatusCode)
 
@@ -1048,11 +1048,7 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) int64 {
 // writeResponse writes resp to the client and returns the number of body
 // bytes written.
 func (p *Proxy) writeResponse(w http.ResponseWriter, resp *http.Response) int64 {
-	// Strip only what came from upstream; headers the proxy already set on
-	// w (Connection: close on a refused CONNECT) stay.
-	upstreamHeader := resp.Header.Clone()
-	removeResponseConnectionHeaders(upstreamHeader)
-	copyHeaders(w.Header(), upstreamHeader)
+	copyUpstreamResponseHeaders(w.Header(), resp.Header)
 	// Forward upstream trailers (e.g. gRPC status) after the body.
 	defer writeTrailers(w, resp)
 	var body io.Reader
@@ -1222,11 +1218,33 @@ func writeTrailers(w http.ResponseWriter, resp *http.Response) {
 	}
 }
 
-// removeResponseConnectionHeaders drops the headers that describe the
-// upstream connection itself. Over HTTP/2 they are a protocol error (curl and
-// nghttp2 reject a forwarded Keep-Alive), and over HTTP/1.1 they would
-// describe the wrong connection. Proxy-Authenticate is kept: on a proxy's own
-// 407 it is addressed to this client.
+// copyUpstreamResponseHeaders copies upstream response headers to dst
+// without their connection-specific fields. Only the upstream copy is
+// stripped; headers the proxy already set on dst (Connection: close on a
+// refused CONNECT) stay.
+func copyUpstreamResponseHeaders(dst, upstream http.Header) {
+	h := upstream.Clone()
+	removeResponseConnectionHeaders(h)
+	copyHeaders(dst, h)
+}
+
+// responseHopByHopHeaders describe the upstream connection itself (RFC 9110
+// section 7.6.1, plus the non-standard Proxy-Connection). Over HTTP/2 they
+// are a protocol error (RFC 9113 section 8.2.2: curl and nghttp2 reject a
+// forwarded Keep-Alive), and over HTTP/1.1 they would describe the wrong
+// connection. Proxy-Authenticate is kept: on a proxy's own 407 it is
+// addressed to this client. Trailer is kept: it announces end-to-end
+// trailers such as gRPC status.
+var responseHopByHopHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// removeResponseConnectionHeaders drops responseHopByHopHeaders and every
+// header named by a Connection token.
 func removeResponseConnectionHeaders(h http.Header) {
 	for _, v := range h.Values("Connection") {
 		for _, t := range strings.Split(v, ",") {
@@ -1235,7 +1253,7 @@ func removeResponseConnectionHeaders(h http.Header) {
 			}
 		}
 	}
-	for _, name := range []string{"Connection", "Proxy-Connection", "Keep-Alive", "Transfer-Encoding"} {
+	for _, name := range responseHopByHopHeaders {
 		h.Del(name)
 	}
 }
